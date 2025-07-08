@@ -1,0 +1,58 @@
+# ======================= m2m_config.yaml =======================
+# Configuration for Mel-to-Mel alignment training
+
+# ────────────────────────────────
+#  Dataset
+# ────────────────────────────────
+train_csv:    align/train.csv     # CSV with 'source','target' columns pointing to .pt files with 'mel' & 'log_f0'
+valid_csv:    align/valid.csv
+map_location: cpu                 # torch.load map_location
+
+# ────────────────────────────────
+#  DataLoader
+# ────────────────────────────────
+batch_size:   4
+num_workers:  4
+
+# ────────────────────────────────
+#  Model / Transformer Hyperparameters
+# ────────────────────────────────
+input_dim_mel:    80            # Log-mel spectrogram size (n_mels)
+input_dim_pitch:  1             # Pitch feature size
+d_model:          256           # Transformer hidden dimension
+nhead:            4             # Number of attention heads
+num_layers:       3             # Number of encoder/decoder layers
+dim_ff:           512           # Feed-forward hidden dimension
+dropout:          0.1           # Dropout rate
+
+# ────────────────────────────────
+#  Loss weights
+# ────────────────────────────────
+diag_w:            1.0         # Diagonal attention regularization weight
+ce_w:              1.0         # EOS classification weight
+
+# ────────────────────────────────
+#  Free-run settings
+# ────────────────────────────────
+free_run_interval: 100          # Add free-run loss every N batches
+free_run_weight:   1.0          # Weight for free-run L1 loss
+free_run_segment:  200          # Segment length for free-run decoding
+
+# ────────────────────────────────
+#  Optimizer / Training
+# ────────────────────────────────
+lr:                0.0002      # AdamW learning rate
+max_epochs:        100         # Total epochs
+gpus:              1           # Number of GPUs (or 0 for CPU)
+precision:         16-mixed    # Use mixed-precision training
+gradient_clip_val: 1.0         # Gradient clipping value
+
+# ────────────────────────────────
+#  Logging & Checkpoints
+# ────────────────────────────────
+work_dir:          /media/akio/hdd1/rvc/models/align/m2m      # Lightning default_root_dir
+log_dir:           /media/akio/hdd1/rvc/models/align/m2m/tb   # TensorBoard logs
+ckpt_dir:          /media/akio/hdd1/rvc/models/align/m2m/ckpt # ModelCheckpoint directory
+save_top_k:        3                                  # Keep top-3 checkpoints
+check_val_every_n_epoch: 1                              # How often to run validation
+# ===============================================================

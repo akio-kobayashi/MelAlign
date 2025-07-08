@@ -1,0 +1,244 @@
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+
+# --- Sinusoidal Positional Encoding ---
+class FixedPositionalEncoding(nn.Module):
+    """学習しない正弦位置エンコーダ"""
+    def __init__(self, d_model: int, max_len: int = 4000):
+        super().__init__()
+        self.d_model = d_model
+        self.register_buffer("pe", self._build_pe(max_len))
+
+    def _build_pe(self, length: int) -> torch.Tensor:
+        pos = torch.arange(length, dtype=torch.float32).unsqueeze(1)
+        div = torch.exp(
+            torch.arange(0, self.d_model, 2, dtype=torch.float32)
+            * (-math.log(10000.0) / self.d_model)
+        )
+        pe = torch.zeros(length, self.d_model, dtype=torch.float32)
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        return pe
+
+    def forward(self, x: torch.Tensor, start: int = 0) -> torch.Tensor:
+        L = x.size(1)
+        need = start + L
+        if need > self.pe.size(0):
+            extra = self._build_pe(need - self.pe.size(0)).to(self.pe.device)
+            self.pe = torch.cat([self.pe, extra], dim=0)
+        return x + self.pe[start : start + L]
+
+# --- Diagonal Bias Mask ---
+def compute_diagonal_mask(T: int, S: int, nu: float = 0.3, device=None) -> torch.Tensor:
+    tgt = torch.arange(T, device=device).unsqueeze(1).float() / (T - 1)
+    src = torch.arange(S, device=device).unsqueeze(0).float() / (S - 1)
+    diff = (src - tgt) ** 2
+    weight = torch.exp(-diff / (2 * nu * nu))
+    mask = torch.log(weight)
+    mask = torch.clamp(mask, min=-1e9)
+
+    bad_row = (mask == -1e9).all(dim=-1)
+    if bad_row.any():
+        rows = bad_row.nonzero(as_tuple=False).squeeze(1)
+        cols = ((src - tgt).abs().argmin(dim=-1))[rows]
+        mask[rows, cols] = 0.0
+
+    return mask
+
+# --- Safe Attention Mask Conversion ---
+def safe_attn_mask(mask: torch.Tensor, neg_inf: float = -1e4) -> torch.Tensor:
+    if mask is None:
+        return None
+    if mask.dtype == torch.bool:
+        return mask
+    mask = mask.clone()
+    mask[mask != mask] = neg_inf
+    mask[mask == float('-inf')] = neg_inf
+    all_inf = (mask == neg_inf).all(dim=-1, keepdim=True)
+    mask = mask.masked_fill(all_inf, 0.0)
+    return mask
+
+# --- Transformer Aligner for Log-Mel Spectrogram ---
+class TransformerAlignerMel(nn.Module):
+    def __init__(
+        self,
+        input_dim_mel: int = 80,
+        input_dim_pitch: int = 1,
+        d_model: int = 256,
+        nhead: int = 4,
+        num_layers: int = 3,
+        dim_feedforward: int = 512,
+        dropout: float = 0.1,
+        nu: float = 0.3,
+        diag_weight: float = 1.0,
+        ce_weight: float = 1.0
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.nu = nu
+        self.diag_weight = diag_weight
+        self.ce_weight = ce_weight
+
+        # Projections
+        self.mel_proj   = nn.Linear(input_dim_mel, d_model)
+        self.pitch_proj = nn.Linear(input_dim_pitch, d_model)
+        self.posenc     = FixedPositionalEncoding(d_model, max_len=8000)
+
+        # Encoder layers
+        self.encoder_layers = nn.ModuleList()
+        for _ in range(num_layers):
+            self.encoder_layers.append(nn.ModuleDict({
+                'self_attn':  nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True),
+                'pitch_attn': nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True),
+                'ffn':        nn.Sequential(
+                    nn.Linear(d_model, dim_feedforward),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(dim_feedforward, d_model),
+                    nn.Dropout(dropout)
+                )
+            }))
+
+        # Decoder layers
+        self.decoder_layers = nn.ModuleList()
+        for _ in range(num_layers):
+            self.decoder_layers.append(nn.ModuleDict({
+                'self_attn':  nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True),
+                'pitch_attn': nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True),
+                'cross_attn': nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True),
+                'ffn':        nn.Sequential(
+                    nn.Linear(d_model, dim_feedforward),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(dim_feedforward, d_model),
+                    nn.Dropout(dropout)
+                )
+            }))
+
+        # Output heads and tokens
+        self.out_mel          = nn.Linear(d_model, input_dim_mel)
+        self.out_pitch        = nn.Linear(d_model, input_dim_pitch)
+        self.token_classifier = nn.Linear(d_model, 2)
+        self.bos_token        = nn.Parameter(torch.randn(1,1,d_model))
+        self.eos_token        = nn.Parameter(torch.randn(1,1,d_model))
+
+    def forward(self, src_mel, src_pitch, tgt_mel, tgt_pitch):
+        B, S, _ = src_mel.size()
+        _, T, _ = tgt_mel.size()
+        device  = src_mel.device
+
+        # Encoder
+        x = self.mel_proj(src_mel) + self.pitch_proj(src_pitch.unsqueeze(-1))
+        x = self.posenc(x)
+        p_enc = self.pitch_proj(src_pitch.unsqueeze(-1))
+
+        def enc_block(x, p_stream, layer):
+            x2, _ = layer['self_attn'](x, x, x, need_weights=False)
+            x_    = layer['ffn'](x + x2)
+            x2p, _ = layer['pitch_attn'](x_, p_stream, p_stream, need_weights=False)
+            return layer['ffn'](x_ + x2p)
+
+        for layer in self.encoder_layers:
+            x = checkpoint(enc_block, x, p_enc, layer)
+        memory = x
+
+        # Decoder init
+        bos = self.bos_token.expand(B, 1, self.d_model)
+        t_h = self.mel_proj(tgt_mel)
+        t_p = self.pitch_proj(tgt_pitch.unsqueeze(-1))
+        decoder_input = torch.cat([bos, t_h + t_p], dim=1)
+        decoder_input = self.posenc(decoder_input)
+
+        p_dec = torch.cat([torch.zeros(B,1,self.d_model, device=device), t_p], dim=1)
+        mask = compute_diagonal_mask(decoder_input.size(1), S, self.nu, device)
+
+        def dec_block(x, p_stream, memory, layer, mask):
+            y2, _ = layer['self_attn'](x, x, x, need_weights=False)
+            y_     = layer['ffn'](x + y2)
+            y2p, _ = layer['pitch_attn'](y_, p_stream, p_stream, need_weights=False)
+            y__    = layer['ffn'](y_ + y2p)
+            y2m, attn = layer['cross_attn'](y__, memory, memory, attn_mask=mask, need_weights=True)
+            return layer['ffn'](y__ + y2m), attn
+
+        attn_w = None
+        x_dec = decoder_input
+        for layer in self.decoder_layers:
+            x_dec, attn_w = checkpoint(dec_block, x_dec, p_dec, memory, layer, mask)
+
+        # Outputs
+        pred_mel   = self.out_mel(x_dec)
+        pred_pitch = self.out_pitch(x_dec).squeeze(-1)
+        logits     = self.token_classifier(x_dec)
+
+        # Loss
+        tgt_mel_pad = torch.cat([tgt_mel, torch.zeros(B,1,tgt_mel.size(-1),device=device)], dim=1)
+        tgt_p_pad   = torch.cat([tgt_pitch.unsqueeze(-1), torch.zeros(B,1,1,device=device)], dim=1).squeeze(-1)
+
+        loss_mel = F.l1_loss(pred_mel, tgt_mel_pad)
+        loss_p   = F.l1_loss(pred_pitch, tgt_p_pad)
+
+        # Diagonal loss
+        pos_s = torch.arange(S, device=device).unsqueeze(0).repeat(T+1,1)
+        pos_t = torch.arange(T+1, device=device).unsqueeze(1).repeat(1,S)
+        dist  = torch.abs(pos_t - pos_s).float()/S
+        loss_diag = (attn_w * dist.unsqueeze(0)).sum()/(B*(T+1))
+
+        # EOS CE loss
+        labels = torch.zeros(B, T+1, dtype=torch.long, device=device)
+        labels[:,-1] = 1
+        logits_clamped = torch.clamp(logits, -20.0, 20.0)
+        loss_ce = F.cross_entropy(logits_clamped.view(-1,2), labels.view(-1), label_smoothing=0.1)
+
+        total = loss_mel + loss_p + self.diag_weight*loss_diag + self.ce_weight*loss_ce
+        return total, {'mel_l1': loss_mel, 'pitch_l1': loss_p, 'diag': loss_diag, 'ce': loss_ce}
+
+    def greedy_decode(self, src_mel, src_pitch, max_len=200):
+        B, S, _ = src_mel.size()
+        device  = src_mel.device
+
+        # Encode
+        x = self.mel_proj(src_mel) + self.pitch_proj(src_pitch.unsqueeze(-1))
+        x = self.posenc(x)
+        for layer in self.encoder_layers:
+            x = layer['ffn'](x + layer['self_attn'](x,x,x)[0])
+            p = self.pitch_proj(src_pitch.unsqueeze(-1))
+            x = layer['ffn'](x + layer['pitch_attn'](x,p,p)[0])
+        memory = x
+
+        # Decode loop
+        current = self.bos_token.expand(B,1,self.d_model)
+        decoded_m, decoded_p = [], []
+        ended = torch.zeros(B, dtype=torch.bool, device=device)
+
+        for t in range(max_len):
+            y = current
+            for layer in self.decoder_layers:
+                y = layer['ffn'](y + layer['self_attn'](y,y,y)[0])
+                p_stream = torch.cat([torch.zeros(B,1,self.d_model,device=device), torch.cat(decoded_p,dim=1).unsqueeze(-1) if decoded_p else torch.zeros(B,1,1,device=device)], dim=1)
+                y = layer['ffn'](y + layer['pitch_attn'](y,p_stream,p_stream)[0])
+                float_mask = safe_attn_mask(compute_diagonal_mask(y.size(1), memory.size(1), self.nu, device), -1e9)
+                bool_mask = (float_mask == -1e9)
+                y2m, _ = layer['cross_attn'](y, memory, memory, attn_mask=bool_mask)
+                y = layer['ffn'](y + y2m)
+
+            last = y[:, -1, :]
+            m_pred = self.out_mel(last)
+            p_pred = self.out_pitch(last).squeeze(-1)
+
+            decoded_m.append(m_pred.unsqueeze(1))
+            decoded_p.append(p_pred.unsqueeze(1))
+
+            fused = self.mel_proj(m_pred) + self.pitch_proj(p_pred.unsqueeze(-1))
+            fused = self.posenc(fused.unsqueeze(1), start=current.size(1)).squeeze(1)
+            current = torch.cat([current, fused.unsqueeze(1)], dim=1)
+
+            ended |= (self.token_classifier(last).argmax(-1)==1)
+            if ended.all():
+                break
+
+        mel_seq  = torch.cat(decoded_m, dim=1)
+        pitch_seq= torch.cat(decoded_p, dim=1)
+        return mel_seq, pitch_seq
