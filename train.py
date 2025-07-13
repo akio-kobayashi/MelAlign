@@ -66,9 +66,9 @@ def train(cfg: dict):
         dropout=cfg.get("dropout", 0.1),
         diag_w=cfg.get("diag_w", 1.0),
         ce_w=cfg.get("ce_w", 1.0),
-        free_run_interval=cfg.get("free_run_interval", 100),
-        free_run_weight=cfg.get("free_run_weight", 1.0),
-        free_run_segment=cfg.get("free_run_segment", 200),
+        #free_run_interval=cfg.get("free_run_interval", 100),
+        #free_run_weight=cfg.get("free_run_weight", 1.0),
+        #free_run_segment=cfg.get("free_run_segment", 200),
     )
 
     # ─── callbacks / logger ─────────────────────────────────
