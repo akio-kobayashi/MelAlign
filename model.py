@@ -142,7 +142,8 @@ class TransformerAlignerMel(nn.Module):
             return layer['ffn'](x_ + x2p)
 
         for layer in self.encoder_layers:
-            x = checkpoint(enc_block, x, p_enc, layer)
+            #x = checkpoint(enc_block, x, p_enc, layer)
+            x = enc_block(x, p_enc, layer)
         memory = x
 
         # Decoder init
@@ -166,7 +167,8 @@ class TransformerAlignerMel(nn.Module):
         attn_w = None
         x_dec = decoder_input
         for layer in self.decoder_layers:
-            x_dec, attn_w = checkpoint(dec_block, x_dec, p_dec, memory, layer, mask)
+            x_dec, attn_w = dec_block(x_dec, p_dec, memory, layer, mask)
+            #x_dec, attn_w = checkpoint(dec_block, x_dec, p_dec, memory, layer, mask)
 
         # Outputs
         pred_mel   = self.out_mel(x_dec)
@@ -196,49 +198,198 @@ class TransformerAlignerMel(nn.Module):
         return total, {'mel_l1': loss_mel, 'pitch_l1': loss_p, 'diag': loss_diag, 'ce': loss_ce}
 
     def greedy_decode(self, src_mel, src_pitch, max_len=200):
-        B, S, _ = src_mel.size()
-        device  = src_mel.device
+        """
+        Greedy decode using log-mel spectrogram and pitch with causal mask and dynamic monotonic control.
+        Returns mel_seq: (B, T, F), pitch_seq: (B, T)
+        """
+        B, S, _ = src_mel.size()    # S = メモリ長
+        device = src_mel.device
 
-        # Encode
+        # --- Encode ---
         x = self.mel_proj(src_mel) + self.pitch_proj(src_pitch.unsqueeze(-1))
         x = self.posenc(x)
         for layer in self.encoder_layers:
-            x = layer['ffn'](x + layer['self_attn'](x,x,x)[0])
+            x2, _ = layer['self_attn'](x, x, x)
+            x = layer['ffn'](x + x2)
             p = self.pitch_proj(src_pitch.unsqueeze(-1))
-            x = layer['ffn'](x + layer['pitch_attn'](x,p,p)[0])
+            x2p, _ = layer['pitch_attn'](x, p, p)
+            x = layer['ffn'](x + x2p)
         memory = x
 
-        # Decode loop
-        current = self.bos_token.expand(B,1,self.d_model)
+        # --- Decode loop ---
+        current = self.bos_token.expand(B, 1, self.d_model)
+        decoded_m, decoded_p = [], []
+        decoded_p_embed = []       # pitch 埋め込みを時系列でためておく
+        memory_mask = None
+        ended = torch.zeros(B, dtype=torch.bool, device=device)
+
+        for t in range(max_len):
+            y = current
+
+            # 1) pitch_stream を組み立て
+            if decoded_p_embed:
+                p_stream = torch.cat(decoded_p_embed, dim=1)  # (B, t, D)
+            else:
+                p_stream = torch.zeros(B, 1, self.d_model, device=device)
+
+            # 各デコーダ層を通過
+            for layer in self.decoder_layers:
+                # causal self-attention
+                T_y = y.size(1)
+                causal_mask = torch.triu(torch.full((T_y, T_y), float('-inf'), device=device), diagonal=1)
+                y2, _ = layer['self_attn'](y, y, y, attn_mask=causal_mask)
+                y = layer['ffn'](y + y2)
+
+                # pitch cross-attention
+                y2p, _ = layer['pitch_attn'](y, p_stream, p_stream)
+                y = layer['ffn'](y + y2p)
+
+                # diagonal + dynamic monotonic cross-attention
+                diag_mask = compute_diagonal_mask(T_y, S, self.nu, device)  # (T_y, S)
+
+                if memory_mask is not None:
+                    prev_T, _ = memory_mask.shape  # 前ステップの (T_prev, S)
+                    cur_T = T_y
+                    # 前の mask を今の長さに合わせてパディング or トリム
+                    if prev_T < cur_T:
+                        pad = torch.full((cur_T - prev_T, S), float('-inf'), device=device)
+                        mem = torch.cat([memory_mask, pad], dim=0)
+                    elif prev_T > cur_T:
+                        mem = memory_mask[-cur_T:, :]
+                    else:
+                        mem = memory_mask
+                    combined = diag_mask + mem
+                else:
+                    combined = diag_mask
+
+                bool_mask = (combined == float('-inf'))
+                y2m, attn_w = layer['cross_attn'](y, memory, memory, attn_mask=bool_mask, need_weights=True)
+                y = layer['ffn'](y + y2m)
+
+                # 動的マスクを更新（最後の frame の attention 位置に基づくウィンドウ）
+                last_attn = attn_w[:, -1, :].mean(dim=0)  # (S,)
+                pos = torch.argmax(last_attn).item()
+                start = max(pos - 5, 0)
+                end   = min(pos + 10, S)
+                m_mask = torch.full((T_y, S), float('-inf'), device=device)
+                m_mask[:, start:end] = 0.0
+                memory_mask = m_mask
+
+            # --- フレーム予測 & 次ステップ準備 ---
+            last    = y[:, -1, :]                    # (B, D)
+            m_pred  = self.out_mel(last)             # (B, F)
+            p_pred  = self.out_pitch(last).squeeze(-1)  # (B,)
+
+            decoded_m.append(m_pred.unsqueeze(1))    # list of (B,1,F)
+            decoded_p.append(p_pred.unsqueeze(1))    # list of (B,1)
+
+            # pitch 埋め込みをためておく
+            p1 = self.pitch_proj(p_pred.unsqueeze(-1))  # (B, D)
+            decoded_p_embed.append(p1.unsqueeze(1))     # (B, t+1, D)
+
+            # 次の input
+            fused = self.mel_proj(m_pred) + p1
+            fused = self.posenc(fused.unsqueeze(1), start=current.size(1)).squeeze(1)
+            current = torch.cat([current, fused.unsqueeze(1)], dim=1)
+
+            # EOS チェック
+            ended |= (self.token_classifier(last).argmax(-1) == 1)
+            if ended.all():
+                break
+
+        mel_seq   = torch.cat(decoded_m, dim=1)  # (B, T, F)
+        pitch_seq = torch.cat(decoded_p, dim=1)  # (B, T)
+        return mel_seq, pitch_seq
+
+
+    '''
+    def greedy_decode(self, src_mel, src_pitch, max_len=200):
+        """
+        Greedy decode using log-mel spectrogram and pitch with causal mask and dynamic monotonic control.
+        Returns mel_seq: (B, T, F), pitch_seq: (B, T)
+        """
+        B, S, _ = src_mel.size()
+        device = src_mel.device
+
+        # --- Encode ---
+        x = self.mel_proj(src_mel) + self.pitch_proj(src_pitch.unsqueeze(-1))
+        x = self.posenc(x)
+        for layer in self.encoder_layers:
+            x2, _ = layer['self_attn'](x, x, x)
+            x = layer['ffn'](x + x2)
+            p = self.pitch_proj(src_pitch.unsqueeze(-1))
+            x2p, _ = layer['pitch_attn'](x, p, p)
+            x = layer['ffn'](x + x2p)
+        memory = x
+
+        # prepare monotonic mask placeholder
+        memory_mask = None
+
+        # --- Decode loop ---
+        current = self.bos_token.expand(B, 1, self.d_model)
         decoded_m, decoded_p = [], []
         ended = torch.zeros(B, dtype=torch.bool, device=device)
 
         for t in range(max_len):
             y = current
             for layer in self.decoder_layers:
-                y = layer['ffn'](y + layer['self_attn'](y,y,y)[0])
-                p_stream = torch.cat([torch.zeros(B,1,self.d_model,device=device), torch.cat(decoded_p,dim=1).unsqueeze(-1) if decoded_p else torch.zeros(B,1,1,device=device)], dim=1)
-                y = layer['ffn'](y + layer['pitch_attn'](y,p_stream,p_stream)[0])
-                float_mask = safe_attn_mask(compute_diagonal_mask(y.size(1), memory.size(1), self.nu, device), -1e9)
-                bool_mask = (float_mask == -1e9)
-                y2m, _ = layer['cross_attn'](y, memory, memory, attn_mask=bool_mask)
+                # 1) causal self-attention
+                T_y = y.size(1)
+                causal_mask = torch.triu(torch.full((T_y, T_y), float('-inf'), device=device), diagonal=1)
+                y2, _ = layer['self_attn'](y, y, y, attn_mask=causal_mask)
+                y = layer['ffn'](y + y2)
+
+                # 2) pitch cross-attention
+                p_stream = torch.cat([
+                    torch.zeros(B, 1, self.d_model, device=device),
+                    torch.cat(decoded_p, dim=1).unsqueeze(-1) if decoded_p else torch.zeros(B, 1, 1, device=device)
+                ], dim=1)
+                y2p, _ = layer['pitch_attn'](y, p_stream, p_stream)
+                y = layer['ffn'](y + y2p)
+
+                # 3) diagonal + dynamic monotonic cross-attention
+                diag_mask = compute_diagonal_mask(y.size(1), S, self.nu, device)
+                combined = diag_mask
+                if memory_mask is not None:
+                    combined = combined + memory_mask
+                bool_mask = (combined == float('-inf'))
+                y2m, attn_w = layer['cross_attn'](y, memory, memory, attn_mask=bool_mask, need_weights=True)
                 y = layer['ffn'](y + y2m)
 
-            last = y[:, -1, :]
-            m_pred = self.out_mel(last)
-            p_pred = self.out_pitch(last).squeeze(-1)
+                # update dynamic mask based on last attention
+                last_attn = attn_w[:, -1, :].mean(dim=0)  # (S,)
+                pos = torch.argmax(last_attn).item()
+                start = max(pos - 5, 0)
+                end = min(pos + 10, S)
+                # build new mask for next step
+                m_mask = torch.full((y.size(1), S), float('-inf'), device=device)
+                m_mask[:, start:end] = 0.0
+                memory_mask = m_mask
 
+            # predict last frame
+            last = y[:, -1, :]
+            m_pred = self.out_mel(last)           # (B, F)
+            p_pred = self.out_pitch(last).squeeze(-1)  # (B,)
             decoded_m.append(m_pred.unsqueeze(1))
             decoded_p.append(p_pred.unsqueeze(1))
 
+            # prepare next input
             fused = self.mel_proj(m_pred) + self.pitch_proj(p_pred.unsqueeze(-1))
             fused = self.posenc(fused.unsqueeze(1), start=current.size(1)).squeeze(1)
             current = torch.cat([current, fused.unsqueeze(1)], dim=1)
 
-            ended |= (self.token_classifier(last).argmax(-1)==1)
+            # check EOS
+            ended |= (self.token_classifier(last).argmax(-1) == 1)
             if ended.all():
                 break
 
-        mel_seq  = torch.cat(decoded_m, dim=1)
-        pitch_seq= torch.cat(decoded_p, dim=1)
+        mel_seq = torch.cat(decoded_m, dim=1)
+        pitch_seq = torch.cat(decoded_p, dim=1)
         return mel_seq, pitch_seq
+    '''
+    
+    def predict(self, src_mel, src_pitch, max_len=200):
+        """
+        Wrapper around greedy_decode for inference.
+        """
+        return self.greedy_decode(src_mel, src_pitch, max_len)
