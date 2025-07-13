@@ -223,7 +223,7 @@ class TransformerAlignerMel(nn.Module):
 
                 pred_p_b = pred_pitch[b, :T_b]                        # (T_b,)
                 true_p_b = torch.cat([
-                    tgt_pitch[b, :L_b].unsqueeze(0),                  # 実データ部分
+                tgt_pitch[b, :L_b],                                   # 実データ部分
                     torch.zeros(1, device=device)                     # EOS 用ゼロ
                 ], dim=0)                                             # (T_b,)
 
