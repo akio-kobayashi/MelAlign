@@ -22,7 +22,7 @@ class FixedPositionalEncoding(nn.Module):
         pe[:, 0::2] = torch.sin(pos * div)
         pe[:, 1::2] = torch.cos(pos * div)
         return pe
-
+  
     def forward(self, x: torch.Tensor, start: int = 0) -> torch.Tensor:
         L = x.size(1)
         need = start + L
@@ -125,6 +125,102 @@ class TransformerAlignerMel(nn.Module):
         self.bos_token        = nn.Parameter(torch.randn(1,1,d_model))
         self.eos_token        = nn.Parameter(torch.randn(1,1,d_model))
 
+    def forward(self,
+                src_mel, src_pitch, src_lengths,
+                tgt_mel, tgt_pitch, tgt_lengths):
+        B, S, _ = src_mel.size()
+        _, T, _ = tgt_mel.size()
+        device  = src_mel.device
+        
+        # パディングマスク
+        # src_pad_mask[b, i] = True if frame i is padding
+        src_pad_mask = torch.arange(S, device=device).unsqueeze(0).expand(B, S)
+        src_pad_mask = src_pad_mask >= src_lengths.unsqueeze(1)
+        # tgt 用は bos を含むので長さは T+1
+        tgt_pad_mask = torch.arange(T+1, device=device).unsqueeze(0).expand(B, T+1)
+        tgt_pad_mask = tgt_pad_mask >= (tgt_lengths + 1).unsqueeze(1)
+
+        # ─── Encoder ──
+        x = self.mel_proj(src_mel) + self.pitch_proj(src_pitch.unsqueeze(-1))
+        x = self.posenc(x)
+        p_enc = self.pitch_proj(src_pitch.unsqueeze(-1))
+
+        for layer in self.encoder_layers:
+            # self-attn with src_pad_mask
+            x2, _ = layer['self_attn'](
+                x, x, x,
+                key_padding_mask=src_pad_mask,
+                need_weights=False)
+            x = layer['ffn'](x + x2)
+
+            # pitch-attn with same mask
+            x2p, _ = layer['pitch_attn'](
+                x, p_enc, p_enc,
+                key_padding_mask=src_pad_mask,
+                need_weights=False)
+            x = layer['ffn'](x + x2p)
+        memory = x
+
+        # ─── Decoder i
+        bos = self.bos_token.expand(B, 1, self.d_model)
+        t_h = self.mel_proj(tgt_mel)
+        t_p = self.pitch_proj(tgt_pitch.unsqueeze(-1))
+        decoder_input = torch.cat([bos, t_h + t_p], dim=1)
+        decoder_input = self.posenc(decoder_input)
+
+        p_dec = torch.cat([torch.zeros(B,1,self.d_model, device=device), t_p], dim=1)
+        # 対角マスクは (T+1, S)
+        mask = compute_diagonal_mask(T+1, S, self.nu, device)
+
+        # ─── Decoder ─
+        x_dec = decoder_input
+        for layer in self.decoder_layers:
+            # causal self-attn (tgt→tgt) に tgt_pad_mask
+            causal_mask = torch.triu(
+                torch.full((x_dec.size(1), x_dec.size(1)), float('-inf'), device=device),
+                diagonal=1)
+            y2, _ = layer['self_attn'](
+                x_dec, x_dec, x_dec,
+                attn_mask=causal_mask,
+                key_padding_mask=tgt_pad_mask,
+                need_weights=False)
+            y = layer['ffn'](x_dec + y2)
+
+            # pitch-attn
+            y2p, _ = layer['pitch_attn'](
+                y, p_dec, p_dec,
+                need_weights=False)
+            y = layer['ffn'](y + y2p)
+
+            # cross-attn with both masks
+            bool_mask = (mask == float('-inf'))
+            y2m, attn_w = layer['cross_attn'](
+                y, memory, memory,
+                attn_mask=bool_mask,
+                key_padding_mask=src_pad_mask,
+                need_weights=True)
+            x_dec = layer['ffn'](y + y2m)
+
+        # ─── 出力・損失
+        pred_mel   = self.out_mel(x_dec)
+        pred_pitch = self.out_pitch(x_dec).squeeze(-1)
+        logits     = self.token_classifier(x_dec)
+
+        # パディングを除いた損失計算
+        loss_mel = 0
+        loss_p   = 0
+        for b in range(B):
+            L = tgt_lengths[b].item() + 1  # bos 含む
+            loss_mel += F.l1_loss(pred_mel[b, :L], torch.cat([tgt_mel[b], torch.zeros(1, tgt_mel.size(-1), device=device)]))
+            loss_p   += F.l1_loss(pred_pitch[b, :L], torch.cat([tgt_pitch[b].unsqueeze(0), torch.zeros(1, device=device)]))
+        loss_mel /= B
+        loss_p   /= B
+
+        # 以下、loss_diag, loss_ce は変更なし
+        total = loss_mel + loss_p + self.diag_weight*loss_diag + self.ce_weight*loss_ce
+        return total, {'mel_l1': loss_mel, 'pitch_l1': loss_p, 'diag': loss_diag, 'ce': loss_ce}
+
+    '''
     def forward(self, src_mel, src_pitch, tgt_mel, tgt_pitch):
         B, S, _ = src_mel.size()
         _, T, _ = tgt_mel.size()
@@ -196,7 +292,8 @@ class TransformerAlignerMel(nn.Module):
 
         total = loss_mel + loss_p + self.diag_weight*loss_diag + self.ce_weight*loss_ce
         return total, {'mel_l1': loss_mel, 'pitch_l1': loss_p, 'diag': loss_diag, 'ce': loss_ce}
-
+    '''
+    
     def greedy_decode(self, src_mel, src_pitch, max_len=200):
         """
         Greedy decode using log-mel spectrogram and pitch with causal mask and dynamic monotonic control.

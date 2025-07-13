@@ -6,20 +6,24 @@ from typing import List, Tuple
 import torch
 from torch.utils.data import Dataset
 
-
-def collate_m2m(batch: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]):
+def collate_m2m(batch):
     """
     Collate function to pad a batch of (src_mel, src_pitch, tgt_mel, tgt_pitch).
-    Returns padded tensors:
+    Returns:
       src_mel_pad: (B, T_src_max, D)
       src_pitch_pad: (B, T_src_max)
       tgt_mel_pad: (B, T_tgt_max, D)
       tgt_pitch_pad: (B, T_tgt_max)
+      src_lengths:  (B,) 実フレーム長
+      tgt_lengths:  (B,) 実フレーム長
     """
     src_m_list, src_p_list, tgt_m_list, tgt_p_list = zip(*batch)
     B = len(batch)
-    T_src_max = max(t.size(0) for t in src_m_list)
-    T_tgt_max = max(t.size(0) for t in tgt_m_list)
+    src_lengths = torch.tensor([sm.size(0) for sm in src_m_list], dtype=torch.long)
+    tgt_lengths = torch.tensor([tm.size(0) for tm in tgt_m_list], dtype=torch.long)
+
+    T_src_max = src_lengths.max().item()
+    T_tgt_max = tgt_lengths.max().item()
     D = src_m_list[0].size(1)
 
     src_mel_pad   = torch.zeros(B, T_src_max, D)
@@ -28,13 +32,13 @@ def collate_m2m(batch: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torc
     tgt_pitch_pad = torch.zeros(B, T_tgt_max)
 
     for i, (sm, sp, tm, tp) in enumerate(batch):
-        src_mel_pad[i, :sm.size(0)] = sm
-        src_pitch_pad[i, :sp.size(0)] = sp
-        tgt_mel_pad[i, :tm.size(0)] = tm
-        tgt_pitch_pad[i, :tp.size(0)] = tp
+        Ls, Lt = sm.size(0), tm.size(0)
+        src_mel_pad[i, :Ls]   = sm
+        src_pitch_pad[i, :Ls] = sp
+        tgt_mel_pad[i, :Lt]   = tm
+        tgt_pitch_pad[i, :Lt] = tp
 
-    return src_mel_pad, src_pitch_pad, tgt_mel_pad, tgt_pitch_pad
-
+    return src_mel_pad, src_pitch_pad, tgt_mel_pad, tgt_pitch_pad, src_lengths, tgt_lengths
 
 class Mel2MelDataset(Dataset):
     """
