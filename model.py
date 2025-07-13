@@ -201,20 +201,38 @@ class TransformerAlignerMel(nn.Module):
                 need_weights=True)
             x_dec = layer['ffn'](y + y2m)
 
-        # ─── 出力・損失
-        pred_mel   = self.out_mel(x_dec)
-        pred_pitch = self.out_pitch(x_dec).squeeze(-1)
-        logits     = self.token_classifier(x_dec)
+            # ─── 出力・損失 ─
+            pred_mel   = self.out_mel(x_dec)               # (B, T_max+1, F)
+            pred_pitch = self.out_pitch(x_dec).squeeze(-1) # (B, T_max+1)
+            logits     = self.token_classifier(x_dec)
 
-        # パディングを除いた損失計算
-        loss_mel = 0
-        loss_p   = 0
-        for b in range(B):
-            L = tgt_lengths[b].item() + 1  # bos 含む
-            loss_mel += F.l1_loss(pred_mel[b, :L], torch.cat([tgt_mel[b], torch.zeros(1, tgt_mel.size(-1), device=device)]))
-            loss_p   += F.l1_loss(pred_pitch[b, :L], torch.cat([tgt_pitch[b].unsqueeze(0), torch.zeros(1, device=device)]))
-        loss_mel /= B
-        loss_p   /= B
+            # 損失をサンプルごとに計算
+            loss_mel = 0.0
+            loss_p   = 0.0
+            for b in range(B):
+                L_b = tgt_lengths[b].item()  # 真の tgt フレーム数
+                # teacher-forcing の入力に対する長さは L_b+1 (bos含む)
+                T_b = L_b + 1
+
+                # pred と target の両方を同じ長さ T_b に切り出し
+                pred_m_b = pred_mel[b, :T_b]                          # (T_b, F)
+                true_m_b = torch.cat([
+                    tgt_mel[b, :L_b],                                 # 実データ部分
+                    torch.zeros(1, tgt_mel.size(-1), device=device)   # EOS 用ゼロ
+                ], dim=0)                                             # (T_b, F)
+
+                pred_p_b = pred_pitch[b, :T_b]                        # (T_b,)
+                true_p_b = torch.cat([
+                    tgt_pitch[b, :L_b].unsqueeze(0),                  # 実データ部分
+                    torch.zeros(1, device=device)                     # EOS 用ゼロ
+                ], dim=0)                                             # (T_b,)
+
+                loss_mel += F.l1_loss(pred_m_b, true_m_b)
+                loss_p   += F.l1_loss(pred_p_b, true_p_b)
+
+            # バッチ平均に戻す
+            loss_mel = loss_mel / B
+            loss_p   = loss_p   / B
 
         # 以下、loss_diag, loss_ce は変更なし
         total = loss_mel + loss_p + self.diag_weight*loss_diag + self.ce_weight*loss_ce
