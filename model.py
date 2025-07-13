@@ -201,39 +201,57 @@ class TransformerAlignerMel(nn.Module):
                 need_weights=True)
             x_dec = layer['ffn'](y + y2m)
 
-            # ─── 出力・損失 ─
-            pred_mel   = self.out_mel(x_dec)               # (B, T_max+1, F)
-            pred_pitch = self.out_pitch(x_dec).squeeze(-1) # (B, T_max+1)
-            logits     = self.token_classifier(x_dec)
+        # ─── 出力・損失 ─
+        pred_mel   = self.out_mel(x_dec)               # (B, T_max+1, F)
+        pred_pitch = self.out_pitch(x_dec).squeeze(-1) # (B, T_max+1)
+        logits     = self.token_classifier(x_dec)
 
-            # 損失をサンプルごとに計算
-            loss_mel = 0.0
-            loss_p   = 0.0
-            for b in range(B):
-                L_b = tgt_lengths[b].item()  # 真の tgt フレーム数
-                # teacher-forcing の入力に対する長さは L_b+1 (bos含む)
-                T_b = L_b + 1
-
-                # pred と target の両方を同じ長さ T_b に切り出し
-                pred_m_b = pred_mel[b, :T_b]                          # (T_b, F)
-                true_m_b = torch.cat([
-                    tgt_mel[b, :L_b],                                 # 実データ部分
-                    torch.zeros(1, tgt_mel.size(-1), device=device)   # EOS 用ゼロ
-                ], dim=0)                                             # (T_b, F)
-
-                pred_p_b = pred_pitch[b, :T_b]                        # (T_b,)
-                true_p_b = torch.cat([
+        # 損失をサンプルごとに計算
+        loss_mel = 0.0
+        loss_p   = 0.0
+        for b in range(B):
+            L_b = tgt_lengths[b].item()  # 真の tgt フレーム数
+            # teacher-forcing の入力に対する長さは L_b+1 (bos含む)
+            T_b = L_b + 1
+            
+            # pred と target の両方を同じ長さ T_b に切り出し
+            pred_m_b = pred_mel[b, :T_b]                          # (T_b, F)
+            true_m_b = torch.cat([
+                tgt_mel[b, :L_b],                                 # 実データ部分
+                torch.zeros(1, tgt_mel.size(-1), device=device)   # EOS 用ゼロ
+            ], dim=0)                                             # (T_b, F)
+            
+            pred_p_b = pred_pitch[b, :T_b]                        # (T_b,)
+            true_p_b = torch.cat([
                 tgt_pitch[b, :L_b],                                   # 実データ部分
-                    torch.zeros(1, device=device)                     # EOS 用ゼロ
-                ], dim=0)                                             # (T_b,)
+                torch.zeros(1, device=device)                     # EOS 用ゼロ
+            ], dim=0)                                             # (T_b,)
+            
+            loss_mel += F.l1_loss(pred_m_b, true_m_b)
+            loss_p   += F.l1_loss(pred_p_b, true_p_b)
+            
+        # バッチ平均に戻す
+        loss_mel = loss_mel / B
+        loss_p   = loss_p   / B
 
-                loss_mel += F.l1_loss(pred_m_b, true_m_b)
-                loss_p   += F.l1_loss(pred_p_b, true_p_b)
-
-            # バッチ平均に戻す
-            loss_mel = loss_mel / B
-            loss_p   = loss_p   / B
-
+        # --- 対角正則化損失 ---
+        # attn_w は最後のデコーダブロックから返された注意重み (B, T_max+1, S)
+        pos_s = torch.arange(S, device=device).unsqueeze(0).repeat(T+1, 1)
+        pos_t = torch.arange(T+1, device=device).unsqueeze(1).repeat(1, S)
+        dist  = torch.abs(pos_t - pos_s).float() / S
+        # attn_w の shape に合わせて dist を broadcast
+        loss_diag = (attn_w * dist.unsqueeze(0)).sum() / (B * (T+1))
+        
+        # --- EOS クロスエントロピー損失 ---
+        labels = torch.zeros(B, T+1, dtype=torch.long, device=device)
+        labels[:, -1] = 1
+        logits_clamped = torch.clamp(logits, -20.0, 20.0)
+        loss_ce = F.cross_entropy(
+            logits_clamped.view(-1, 2),
+            labels.view(-1),
+            label_smoothing=0.1
+        )
+        
         # 以下、loss_diag, loss_ce は変更なし
         total = loss_mel + loss_p + self.diag_weight*loss_diag + self.ce_weight*loss_ce
         return total, {'mel_l1': loss_mel, 'pitch_l1': loss_p, 'diag': loss_diag, 'ce': loss_ce}
