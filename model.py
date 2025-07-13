@@ -179,6 +179,7 @@ class TransformerAlignerMel(nn.Module):
             causal_mask = torch.triu(
                 torch.full((x_dec.size(1), x_dec.size(1)), float('-inf'), device=device),
                 diagonal=1)
+            causal_mask = (causal_mask == float('-inf'))
             y2, _ = layer['self_attn'](
                 x_dec, x_dec, x_dec,
                 attn_mask=causal_mask,
