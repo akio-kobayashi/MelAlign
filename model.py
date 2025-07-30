@@ -3,6 +3,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+from typing import Tuple, Dict
+
+NEG_INF = float('-1e9')    # Attention マスク用の“大きな負の無限大”はここで統一
 
 # --- Sinusoidal Positional Encoding ---
 class FixedPositionalEncoding(nn.Module):
@@ -31,22 +34,36 @@ class FixedPositionalEncoding(nn.Module):
             self.pe = torch.cat([self.pe, extra], dim=0)
         return x + self.pe[start : start + L]
 
-# --- Diagonal Bias Mask ---
-def compute_diagonal_mask(T: int, S: int, nu: float = 0.3, device=None) -> torch.Tensor:
-    tgt = torch.arange(T, device=device).unsqueeze(1).float() / (T - 1)
-    src = torch.arange(S, device=device).unsqueeze(0).float() / (S - 1)
-    diff = (src - tgt) ** 2
-    weight = torch.exp(-diff / (2 * nu * nu))
-    mask = torch.log(weight)
-    mask = torch.clamp(mask, min=-1e9)
 
-    bad_row = (mask == -1e9).all(dim=-1)
+def compute_diagonal_mask(T: int, S: int, nu: float = 0.3, device=None) -> torch.Tensor:
+    # 正規化座標
+    #tgt = torch.linspace(0, 1, steps=T, device=device).unsqueeze(1)  # (T,1)
+    # T==1 のときはダイアゴナルマスクをゼロにして全キーを使わせる
+    if T == 1:
+        return torch.zeros(1, S, device=device)
+    tgt = torch.arange(T, device=device).unsqueeze(1).float() / (T - 1)   
+    src = torch.linspace(0, 1, steps=S, device=device).unsqueeze(0)  # (1,S)
+    diff = (src - tgt).square()
+    # ← ここを「正規化座標」→「生フレーム座標」に変更
+    #tgt = torch.arange(T, device=device).unsqueeze(1).float()       # (T,1): [0,1,2,…,T-1]
+    #src = torch.arange(S, device=device).unsqueeze(0).float()       # (1,S): [0,1,2,…,S-1]
+    #diff = (src - tgt).square()                                    # 距離^2 (s - t)^2
+    # ガウス重み → ログ
+    mask = -diff / (2 * nu * nu)     # 直接対数空間で計算しても OK
+    # 下限を大きな負数にクリップ
+    neg_inf = NEG_INF
+    mask = mask.clamp(min=neg_inf)
+
+    # 完全にマスクされた行があれば、対角位置だけをゼロに戻す
+    # (mask==NEG_INF) で判定
+    bad_row = (mask == neg_inf).all(dim=-1)
     if bad_row.any():
-        rows = bad_row.nonzero(as_tuple=False).squeeze(1)
-        cols = ((src - tgt).abs().argmin(dim=-1))[rows]
+        rows = bad_row.nonzero(as_tuple=False).view(-1)
+        # 各 bad_row に対して、最も近い列を探して 0 に
+        _, cols = (src - tgt[rows]).abs().min(dim=-1)
         mask[rows, cols] = 0.0
 
-    return mask
+    return mask  # shape: (T, S)
 
 # --- Safe Attention Mask Conversion ---
 def safe_attn_mask(mask: torch.Tensor, neg_inf: float = -1e4) -> torch.Tensor:
@@ -73,14 +90,14 @@ class TransformerAlignerMel(nn.Module):
         dim_feedforward: int = 512,
         dropout: float = 0.1,
         nu: float = 0.3,
-        diag_weight: float = 1.0,
-        ce_weight: float = 1.0
+        diag_w: float = 1.0,
+        ce_w: float = 1.0
     ):
         super().__init__()
         self.d_model = d_model
         self.nu = nu
-        self.diag_weight = diag_weight
-        self.ce_weight = ce_weight
+        self.diag_weight = diag_w
+        self.ce_weight = ce_w
 
         # Projections
         self.mel_proj   = nn.Linear(input_dim_mel, d_model)
@@ -91,9 +108,13 @@ class TransformerAlignerMel(nn.Module):
         self.encoder_layers = nn.ModuleList()
         for _ in range(num_layers):
             self.encoder_layers.append(nn.ModuleDict({
+                'norm1':      nn.LayerNorm(d_model),
                 'self_attn':  nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True),
+                'norm2':      nn.LayerNorm(d_model),
                 'pitch_attn': nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True),
+                'norm3':      nn.LayerNorm(d_model),
                 'ffn':        nn.Sequential(
+                    nn.LayerNorm(d_model),
                     nn.Linear(d_model, dim_feedforward),
                     nn.ReLU(),
                     nn.Dropout(dropout),
@@ -101,15 +122,19 @@ class TransformerAlignerMel(nn.Module):
                     nn.Dropout(dropout)
                 )
             }))
-
         # Decoder layers
         self.decoder_layers = nn.ModuleList()
         for _ in range(num_layers):
             self.decoder_layers.append(nn.ModuleDict({
+                'norm1':      nn.LayerNorm(d_model),
                 'self_attn':  nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True),
+                'norm2':      nn.LayerNorm(d_model),
                 'pitch_attn': nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True),
+                'norm3':      nn.LayerNorm(d_model),
                 'cross_attn': nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True),
+                'norm4':      nn.LayerNorm(d_model),
                 'ffn':        nn.Sequential(
+                    nn.LayerNorm(d_model),
                     nn.Linear(d_model, dim_feedforward),
                     nn.ReLU(),
                     nn.Dropout(dropout),
@@ -117,409 +142,314 @@ class TransformerAlignerMel(nn.Module):
                     nn.Dropout(dropout)
                 )
             }))
-
+            
         # Output heads and tokens
         self.out_mel          = nn.Linear(d_model, input_dim_mel)
         self.out_pitch        = nn.Linear(d_model, input_dim_pitch)
         self.token_classifier = nn.Linear(d_model, 2)
-        self.bos_token        = nn.Parameter(torch.randn(1,1,d_model))
-        self.eos_token        = nn.Parameter(torch.randn(1,1,d_model))
+        #self.bos_token        = nn.Parameter(torch.randn(1,1,d_model))
+        #self.eos_token        = nn.Parameter(torch.randn(1,1,d_model))
+        self.bos_token = nn.Parameter(torch.zeros(1,1,d_model), requires_grad=False)
+        self.eos_token = nn.Parameter(torch.zeros(1,1,d_model), requires_grad=False)
 
-    def forward(self,
-                src_mel, src_pitch, src_lengths,
-                tgt_mel, tgt_pitch, tgt_lengths):
+
+    def forward(
+        self,
+        src_mel: torch.Tensor,
+        src_pitch: torch.Tensor,
+        src_lengths: torch.Tensor,
+        tgt_mel: torch.Tensor,
+        tgt_pitch: torch.Tensor,
+        tgt_lengths: torch.Tensor
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         B, S, _ = src_mel.size()
         _, T, _ = tgt_mel.size()
         device  = src_mel.device
-        
-        # パディングマスク
-        # src_pad_mask[b, i] = True if frame i is padding
-        src_pad_mask = torch.arange(S, device=device).unsqueeze(0).expand(B, S)
-        src_pad_mask = src_pad_mask >= src_lengths.unsqueeze(1)
-        # tgt 用は bos を含むので長さは T+1
-        tgt_pad_mask = torch.arange(T+1, device=device).unsqueeze(0).expand(B, T+1)
-        tgt_pad_mask = tgt_pad_mask >= (tgt_lengths + 1).unsqueeze(1)
 
-        # ─── Encoder ──
+        # ─── padding mask (bool) ─────────────────────────────────
+        src_pad_mask = (
+            torch.arange(S, device=device)
+            .unsqueeze(0).expand(B, S)
+            >= src_lengths.unsqueeze(1)
+        )  # (B, S)  True=pad
+
+        tgt_pad_mask = (
+            torch.arange(T+1, device=device)
+            .unsqueeze(0).expand(B, T+1)
+            >= (tgt_lengths + 1).unsqueeze(1)
+        )  # (B, T+1)
+
+        # ─── Encoder ─────────────────────────────────────────────
         x = self.mel_proj(src_mel) + self.pitch_proj(src_pitch.unsqueeze(-1))
         x = self.posenc(x)
         p_enc = self.pitch_proj(src_pitch.unsqueeze(-1))
-
         for layer in self.encoder_layers:
-            # self-attn with src_pad_mask
-            x2, _ = layer['self_attn'](
-                x, x, x,
+            # Pre-Norm self-attention
+            x_norm = layer['norm1'](x)
+            x2, _  = layer['self_attn'](
+                x_norm, x_norm, x_norm,
                 key_padding_mask=src_pad_mask,
-                need_weights=False)
-            x = layer['ffn'](x + x2)
+                need_weights=False
+            )
+            x = x + x2
 
-            # pitch-attn with same mask
+            # Pre-Norm pitch-attention
+            x_norm = layer['norm2'](x)
             x2p, _ = layer['pitch_attn'](
-                x, p_enc, p_enc,
+                x_norm, p_enc, p_enc,
                 key_padding_mask=src_pad_mask,
-                need_weights=False)
-            x = layer['ffn'](x + x2p)
-        memory = x
+                need_weights=False
+            )
+            x = x + x2p
 
-        # ─── Decoder i
-        bos = self.bos_token.expand(B, 1, self.d_model)
-        t_h = self.mel_proj(tgt_mel)
-        t_p = self.pitch_proj(tgt_pitch.unsqueeze(-1))
-        decoder_input = torch.cat([bos, t_h + t_p], dim=1)
-        decoder_input = self.posenc(decoder_input)
-
-        p_dec = torch.cat([torch.zeros(B,1,self.d_model, device=device), t_p], dim=1)
-        # 対角マスクは (T+1, S)
-        mask = compute_diagonal_mask(T+1, S, self.nu, device)
-
-        # ─── Decoder ─
-        x_dec = decoder_input
-        for layer in self.decoder_layers:
-            # causal self-attn (tgt→tgt) に tgt_pad_mask
-            causal_mask = torch.triu(
-                torch.full((x_dec.size(1), x_dec.size(1)), float('-inf'), device=device),
-                diagonal=1)
-            y2, _ = layer['self_attn'](
-                x_dec, x_dec, x_dec,
-                attn_mask=causal_mask,
-                key_padding_mask=tgt_pad_mask,
-                need_weights=False)
-            y = layer['ffn'](x_dec + y2)
-
-            # pitch-attn
-            y2p, _ = layer['pitch_attn'](
-                y, p_dec, p_dec,
-                need_weights=False)
-            y = layer['ffn'](y + y2p)
-
-            # cross-attn with both masks
-            bool_mask = (mask == float('-inf'))
-            y2m, attn_w = layer['cross_attn'](
-                y, memory, memory,
-                attn_mask=bool_mask,
-                key_padding_mask=src_pad_mask,
-                need_weights=True)
-            x_dec = layer['ffn'](y + y2m)
-
-        # ─── 出力・損失 ─
-        pred_mel   = self.out_mel(x_dec)               # (B, T_max+1, F)
-        pred_pitch = self.out_pitch(x_dec).squeeze(-1) # (B, T_max+1)
-        logits     = self.token_classifier(x_dec)
-
-        # 損失をサンプルごとに計算
-        loss_mel = 0.0
-        loss_p   = 0.0
-        for b in range(B):
-            L_b = tgt_lengths[b].item()  # 真の tgt フレーム数
-            # teacher-forcing の入力に対する長さは L_b+1 (bos含む)
-            T_b = L_b + 1
+            # Pre-Norm FFN
+            #x = layer['ffn'](x)
+            x = x + layer['ffn'](layer['norm3'](x))
             
-            # pred と target の両方を同じ長さ T_b に切り出し
-            pred_m_b = pred_mel[b, :T_b]                          # (T_b, F)
-            true_m_b = torch.cat([
-                tgt_mel[b, :L_b],                                 # 実データ部分
-                torch.zeros(1, tgt_mel.size(-1), device=device)   # EOS 用ゼロ
-            ], dim=0)                                             # (T_b, F)
-            
-            pred_p_b = pred_pitch[b, :T_b]                        # (T_b,)
-            true_p_b = torch.cat([
-                tgt_pitch[b, :L_b],                                   # 実データ部分
-                torch.zeros(1, device=device)                     # EOS 用ゼロ
-            ], dim=0)                                             # (T_b,)
-            
-            loss_mel += F.l1_loss(pred_m_b, true_m_b)
-            loss_p   += F.l1_loss(pred_p_b, true_p_b)
-            
-        # バッチ平均に戻す
-        loss_mel = loss_mel / B
-        loss_p   = loss_p   / B
+        memory = x  # (B, S, D)
 
-        # --- 対角正則化損失 ---
-        # attn_w は最後のデコーダブロックから返された注意重み (B, T_max+1, S)
-        pos_s = torch.arange(S, device=device).unsqueeze(0).repeat(T+1, 1)
-        pos_t = torch.arange(T+1, device=device).unsqueeze(1).repeat(1, S)
-        dist  = torch.abs(pos_t - pos_s).float() / S
-        # attn_w の shape に合わせて dist を broadcast
-        loss_diag = (attn_w * dist.unsqueeze(0)).sum() / (B * (T+1))
-        
-        # --- EOS クロスエントロピー損失 ---
-        labels = torch.zeros(B, T+1, dtype=torch.long, device=device)
-        labels[:, -1] = 1
-        logits_clamped = torch.clamp(logits, -20.0, 20.0)
-        loss_ce = F.cross_entropy(
-            logits_clamped.view(-1, 2),
-            labels.view(-1),
-            label_smoothing=0.1
-        )
-        
-        # 以下、loss_diag, loss_ce は変更なし
-        total = loss_mel + loss_p + self.diag_weight*loss_diag + self.ce_weight*loss_ce
-        return total, {'mel_l1': loss_mel, 'pitch_l1': loss_p, 'diag': loss_diag, 'ce': loss_ce}
+        # ──Decoder Init ─────────────────────────────────────────
+        bos   = self.bos_token.expand(B, 1, self.d_model)        # (B,1,D)
+        t_h   = self.mel_proj(tgt_mel)                           # (B,T,D)
+        t_p   = self.pitch_proj(tgt_pitch.unsqueeze(-1))        # (B,T,D)
+        x_dec = torch.cat([bos, t_h + t_p], dim=1)               # (B,T+1,D)
+        x_dec = self.posenc(x_dec)
 
-    '''
-    def forward(self, src_mel, src_pitch, tgt_mel, tgt_pitch):
-        B, S, _ = src_mel.size()
-        _, T, _ = tgt_mel.size()
-        device  = src_mel.device
+        p_dec = torch.cat(
+            [torch.zeros(B,1,self.d_model,device=device), t_p],
+            dim=1
+        )  # (B,T+1,D)
 
-        # Encoder
-        x = self.mel_proj(src_mel) + self.pitch_proj(src_pitch.unsqueeze(-1))
-        x = self.posenc(x)
-        p_enc = self.pitch_proj(src_pitch.unsqueeze(-1))
+        # 2D diagonal mask (T+1, S)
+        diag = compute_diagonal_mask(T+1, S, self.nu, device)
 
-        def enc_block(x, p_stream, layer):
-            x2, _ = layer['self_attn'](x, x, x, need_weights=False)
-            x_    = layer['ffn'](x + x2)
-            x2p, _ = layer['pitch_attn'](x_, p_stream, p_stream, need_weights=False)
-            return layer['ffn'](x_ + x2p)
-
-        for layer in self.encoder_layers:
-            #x = checkpoint(enc_block, x, p_enc, layer)
-            x = enc_block(x, p_enc, layer)
-        memory = x
-
-        # Decoder init
-        bos = self.bos_token.expand(B, 1, self.d_model)
-        t_h = self.mel_proj(tgt_mel)
-        t_p = self.pitch_proj(tgt_pitch.unsqueeze(-1))
-        decoder_input = torch.cat([bos, t_h + t_p], dim=1)
-        decoder_input = self.posenc(decoder_input)
-
-        p_dec = torch.cat([torch.zeros(B,1,self.d_model, device=device), t_p], dim=1)
-        mask = compute_diagonal_mask(decoder_input.size(1), S, self.nu, device)
-
-        def dec_block(x, p_stream, memory, layer, mask):
-            y2, _ = layer['self_attn'](x, x, x, need_weights=False)
-            y_     = layer['ffn'](x + y2)
-            y2p, _ = layer['pitch_attn'](y_, p_stream, p_stream, need_weights=False)
-            y__    = layer['ffn'](y_ + y2p)
-            y2m, attn = layer['cross_attn'](y__, memory, memory, attn_mask=mask, need_weights=True)
-            return layer['ffn'](y__ + y2m), attn
+        # build combined float mask (diag + padding), but only use if diag_weight>0
+        if self.diag_weight > 0:
+            neg_inf    = NEG_INF
+            pad_b      = src_pad_mask.float().unsqueeze(1) * NEG_INF # (B,1,S)
+            pad_b      = pad_b.expand(-1, T+1, -1)                     # (B,T+1,S)
+            float_mask = (diag.unsqueeze(0) + pad_b).clamp(min=NEG_INF)
+        else:
+            float_mask = None
 
         attn_w = None
-        x_dec = decoder_input
+        # ──Decoder Loop ───────────────────────────────────────
         for layer in self.decoder_layers:
-            x_dec, attn_w = dec_block(x_dec, p_dec, memory, layer, mask)
-            #x_dec, attn_w = checkpoint(dec_block, x_dec, p_dec, memory, layer, mask)
+            # 1) causal self-attention（causal マスクを定義）
+            L = x_dec.size(1)
+            causal = torch.triu(
+                torch.full((L, L), NEG_INF, device=device),
+                diagonal=1
+            )  # (L,L)
+            # 先に正規化テンソルを作成してから渡す
+            y_norm, x_dec = layer['norm1'](x_dec), x_dec
+            y2, _ = layer['self_attn'](
+                y_norm, y_norm, y_norm,
+                attn_mask=causal,
+                key_padding_mask=tgt_pad_mask,
+                need_weights=False
+            )
+            y = x_dec + y2
+            # 2) pitch-attn (pre-norm + post-FFN)
+            y2p, _ = layer['pitch_attn'](
+                layer['norm2'](y), p_dec, p_dec,
+                key_padding_mask=tgt_pad_mask
+            )
+            y = y + y2p
+            # 3) cross-attention: 2D diag + padding → 3D mask, no key_padding_mask
+            if float_mask is not None:
+                heads = layer['cross_attn'].num_heads
+                mask3d = (
+                    float_mask
+                    .unsqueeze(1)                     # (B,1,T+1,S)
+                    .expand(-1, heads, -1, -1)        # (B,heads,T+1,S)
+                    .reshape(-1, float_mask.size(1), float_mask.size(2))  # (B*heads,T+1,S)
+                )
+            else:
+                mask3d = None
+            # capture attention weights for diagonal loss
+            y2m, attn_w = layer['cross_attn'](
+                layer['norm3'](y), memory, memory,
+                attn_mask=mask3d,    # (B*heads,T+1,S) or None
+                key_padding_mask=None,
+                need_weights=True
+            )
+            y = y + y2m
+            y = y + layer['ffn'](layer['norm4'](y))
+            x_dec = y  # 次の層へ
+            
+        # ─── Outputs & Loss ──────────────────────────────────────
+        pred_mel   = self.out_mel(x_dec)               # (B, T+1, F)
+        pred_pitch = self.out_pitch(x_dec).squeeze(-1) # (B, T+1)
 
-        # Outputs
-        pred_mel   = self.out_mel(x_dec)
-        pred_pitch = self.out_pitch(x_dec).squeeze(-1)
-        logits     = self.token_classifier(x_dec)
-
-        # Loss
-        tgt_mel_pad = torch.cat([tgt_mel, torch.zeros(B,1,tgt_mel.size(-1),device=device)], dim=1)
-        tgt_p_pad   = torch.cat([tgt_pitch.unsqueeze(-1), torch.zeros(B,1,1,device=device)], dim=1).squeeze(-1)
-
-        loss_mel = F.l1_loss(pred_mel, tgt_mel_pad)
-        loss_p   = F.l1_loss(pred_pitch, tgt_p_pad)
-
-        # Diagonal loss
+        # Teacher‐forcing では pred[:,1:] が tgt と対応
+        # ※ pred[:,0] は BOS→初フレーム の予測なので除外
+        loss_mel = F.l1_loss(pred_mel[:, 1:], tgt_mel)     # compare (B,T,F)
+        loss_p   = F.l1_loss(pred_pitch[:, 1:], tgt_pitch) # compare (B,T)
+        
+        # diagonal regularization
         pos_s = torch.arange(S, device=device).unsqueeze(0).repeat(T+1,1)
         pos_t = torch.arange(T+1, device=device).unsqueeze(1).repeat(1,S)
-        dist  = torch.abs(pos_t - pos_s).float()/S
-        loss_diag = (attn_w * dist.unsqueeze(0)).sum()/(B*(T+1))
+        dist   = torch.abs(pos_t - pos_s).float() / S
+        loss_diag = (attn_w * dist.unsqueeze(0)).sum() / (B * (T + 1))
 
-        # EOS CE loss
-        labels = torch.zeros(B, T+1, dtype=torch.long, device=device)
-        labels[:,-1] = 1
-        logits_clamped = torch.clamp(logits, -20.0, 20.0)
-        loss_ce = F.cross_entropy(logits_clamped.view(-1,2), labels.view(-1), label_smoothing=0.1)
+        # ─── EOS Cross-Entropy only at final step ─────────────────
+        # まずは decoder 出力から logits を取ってくる
+        logits = self.token_classifier(x_dec)           # (B, T+1, 2)
+        idx    = torch.arange(B, device=device)
+        logits_e = logits[idx, tgt_lengths, :]         # (B, 2)
+        labels_e = torch.ones(B, dtype=torch.long, device=device)
+        loss_ce  = F.cross_entropy(logits_e, labels_e, label_smoothing=0.1)
 
-        total = loss_mel + loss_p + self.diag_weight*loss_diag + self.ce_weight*loss_ce
-        return total, {'mel_l1': loss_mel, 'pitch_l1': loss_p, 'diag': loss_diag, 'ce': loss_ce}
-    '''
-    
-    def greedy_decode(self, src_mel, src_pitch, max_len=200):
+        total = loss_mel + loss_p + self.diag_weight * loss_diag + self.ce_weight * loss_ce
+        return total, {
+            "mel_l1":   loss_mel,
+            "pitch_l1": loss_p,
+            "diag":     loss_diag,
+            "ce":       loss_ce
+        }        
+
+    @torch.no_grad()
+    def greedy_decode(
+            self,
+            src_mel:   torch.Tensor,    # (1, S, F)
+            src_pitch: torch.Tensor,    # (1, S)
+            src_len:   int,             # 有効フレーム数
+            max_len:   int = 200
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self.eval()
         """
-        Greedy decode using log-mel spectrogram and pitch with causal mask and dynamic monotonic control.
-        Returns mel_seq: (B, T, F), pitch_seq: (B, T)
+        - batch=1 前提
+        - 学習時と同じ self/pitch/cross-attn 構成
+        - dynamic window + diagonal bias を使った monotonic search
         """
-        B, S, _ = src_mel.size()    # S = メモリ長
         device = src_mel.device
+        S = src_mel.size(1)
+        heads = self.decoder_layers[0]['cross_attn'].num_heads
+        NEG = NEG_INF
 
-        # --- Encode ---
-        x = self.mel_proj(src_mel) + self.pitch_proj(src_pitch.unsqueeze(-1))
-        x = self.posenc(x)
+        # ── ① エンコーダ部 ─────────────────────────────────────
+        enc = self.mel_proj(src_mel) + self.pitch_proj(src_pitch.unsqueeze(-1))
+        enc = self.posenc(enc)
+        p_enc = self.pitch_proj(src_pitch.unsqueeze(-1))
         for layer in self.encoder_layers:
-            x2, _ = layer['self_attn'](x, x, x)
-            x = layer['ffn'](x + x2)
-            p = self.pitch_proj(src_pitch.unsqueeze(-1))
-            x2p, _ = layer['pitch_attn'](x, p, p)
-            x = layer['ffn'](x + x2p)
-        memory = x
+            # self-attn
+            h, _ = layer['self_attn'](
+                layer['norm1'](enc), layer['norm1'](enc), layer['norm1'](enc)
+            )
+            enc = enc + h
+            # pitch-attn
+            h, _ = layer['pitch_attn'](
+                layer['norm2'](enc), p_enc, p_enc
+            )
+            enc = enc + h
+            # FFN
+            enc = enc + layer['ffn'](layer['norm3'](enc))
+        memory = enc                        # (1, S, D)
 
-        # --- Decode loop ---
-        current = self.bos_token.expand(B, 1, self.d_model)
-        decoded_m, decoded_p = [], []
-        decoded_p_embed = []       # pitch 埋め込みを時系列でためておく
-        memory_mask = None
-        ended = torch.zeros(B, dtype=torch.bool, device=device)
+        # ── ② デコーダ初期化 ────────────────────────────────────
+        cur         = self.posenc(self.bos_token.expand(1,1,self.d_model))  # (1,1,D)
+        memory_mask = None              # dynamic window mask (heads, t, S)
+        prev_peak   = 0                 # monotonic enforce 用
+        outs_mel    = []
+        outs_pitch  = []
 
-        for t in range(max_len):
-            y = current
+        # ── ③ 生成ループ ─────────────────────────────────────────
+        for step in range(max_len):
+            T = cur.size(1)
 
-            # 1) pitch_stream を組み立て
-            if decoded_p_embed:
-                p_stream = torch.cat(decoded_p_embed, dim=1)  # (B, t, D)
+            # ── (a) pitch-dec embeddings の更新 ────────────────
+            if step == 0:
+                p_dec = torch.zeros(1, 1, self.d_model, device=device)
             else:
-                p_stream = torch.zeros(B, 1, self.d_model, device=device)
+                pitch_emb = self.pitch_proj(
+                    torch.cat(outs_pitch, dim=1).unsqueeze(-1)  # (1, t, 1)
+                )  # → (1, t, D)
+                p_dec = torch.cat([
+                    torch.zeros(1,1,self.d_model, device=device),
+                    pitch_emb
+                ], dim=1)  # (1, t+1, D)
 
-            # 各デコーダ層を通過
+            y = cur
+            # ── (b) デコーダ層 ───────────────────────────────────
             for layer in self.decoder_layers:
-                # causal self-attention
-                T_y = y.size(1)
-                causal_mask = torch.triu(torch.full((T_y, T_y), float('-inf'), device=device), diagonal=1)
-                y2, _ = layer['self_attn'](y, y, y, attn_mask=causal_mask)
-                y = layer['ffn'](y + y2)
+                # 1) causal self-attn
+                causal = torch.triu(torch.full((T, T), NEG, device=device), 1)
+                h, _ = layer['self_attn'](
+                    layer['norm1'](y), layer['norm1'](y), layer['norm1'](y),
+                    attn_mask=causal
+                )
+                y = y + h
 
-                # pitch cross-attention
-                y2p, _ = layer['pitch_attn'](y, p_stream, p_stream)
-                y = layer['ffn'](y + y2p)
+                # 2) pitch-attn
+                h, _ = layer['pitch_attn'](
+                    layer['norm2'](y), p_dec, p_dec
+                )
+                y = y + h
 
-                # diagonal + dynamic monotonic cross-attention
-                diag_mask = compute_diagonal_mask(T_y, S, self.nu, device)  # (T_y, S)
-
+                # 3) cross-attn: dynamic window + diagonal bias
+                #  3-1) diagonal bias
+                diag2d = compute_diagonal_mask(T, S, self.nu, device)   # (T,S)
+                diag3d = diag2d.unsqueeze(0).expand(heads, -1, -1)     # (heads,T,S)
+                #  3-2) dynamic window merge
                 if memory_mask is not None:
-                    prev_T, _ = memory_mask.shape  # 前ステップの (T_prev, S)
-                    cur_T = T_y
-                    # 前の mask を今の長さに合わせてパディング or トリム
-                    if prev_T < cur_T:
-                        pad = torch.full((cur_T - prev_T, S), float('-inf'), device=device)
-                        mem = torch.cat([memory_mask, pad], dim=0)
-                    elif prev_T > cur_T:
-                        mem = memory_mask[-cur_T:, :]
-                    else:
-                        mem = memory_mask
-                    combined = diag_mask + mem
+                    # pad to length T
+                    if memory_mask.size(1) < T:
+                        pad_len = T - memory_mask.size(1)
+                        pad = torch.full((heads, pad_len, S), NEG, device=device)
+                        memory_mask = torch.cat([memory_mask, pad], dim=1)
+                    merged = diag3d + memory_mask[:, :T, :]
                 else:
-                    combined = diag_mask
+                    merged = diag3d
+                attn_mask = safe_attn_mask(merged, neg_inf=NEG)       # (heads,T,S)
 
-                bool_mask = (combined == float('-inf'))
-                y2m, attn_w = layer['cross_attn'](y, memory, memory, attn_mask=bool_mask, need_weights=True)
-                y = layer['ffn'](y + y2m)
+                h, att_w = layer['cross_attn'](
+                    layer['norm3'](y), memory, memory,
+                    attn_mask=attn_mask,
+                    need_weights=True,
+                    average_attn_weights=True
+                )
+                y = y + h
 
-                # 動的マスクを更新（最後の frame の attention 位置に基づくウィンドウ）
-                last_attn = attn_w[:, -1, :].mean(dim=0)  # (S,)
-                pos = torch.argmax(last_attn).item()
-                start = max(pos - 5, 0)
-                end   = min(pos + 10, S)
-                m_mask = torch.full((T_y, S), float('-inf'), device=device)
-                m_mask[:, start:end] = 0.0
-                memory_mask = m_mask
+                # 4) FFN
+                y = y + layer['ffn'](layer['norm4'](y))
 
-            # --- フレーム予測 & 次ステップ準備 ---
-            last    = y[:, -1, :]                    # (B, D)
-            m_pred  = self.out_mel(last)             # (B, F)
-            p_pred  = self.out_pitch(last).squeeze(-1)  # (B,)
+            # ── (c) 出力プロジェクション ─────────────────────────
+            last_h  = y[:, -1]                       # (1,D)
+            m_raw   = self.out_mel(last_h)           # (1,F)
+            p_raw   = self.out_pitch(last_h).squeeze(-1)  # (1,)
 
-            decoded_m.append(m_pred.unsqueeze(1))    # list of (B,1,F)
-            decoded_p.append(p_pred.unsqueeze(1))    # list of (B,1)
+            # optional: tanh*6 で dB 範囲制限
+            #m_pred  = torch.tanh(m_raw) * 6.0
+            m_pred = m_raw
+            p_pred  = p_raw
 
-            # pitch 埋め込みをためておく
-            p1 = self.pitch_proj(p_pred.unsqueeze(-1))  # (B, D)
-            decoded_p_embed.append(p1.unsqueeze(1))     # (B, t+1, D)
+            outs_mel.append(m_pred.unsqueeze(1))    # list of (1,1,F)
+            outs_pitch.append(p_pred.unsqueeze(1))  # list of (1,1)
 
-            # 次の input
-            fused = self.mel_proj(m_pred) + p1
-            fused = self.posenc(fused.unsqueeze(1), start=current.size(1)).squeeze(1)
-            current = torch.cat([current, fused.unsqueeze(1)], dim=1)
+            # ── (d) モノトニック窓更新 ───────────────────────────
+            att_last = att_w[0, -1, :]              # (S,)
+            raw_peak = int(att_last.argmax())       # 生 argmax
+            peak     = max(prev_peak, raw_peak)     # monotonic enforce
+            prev_peak = peak
+            lo  = max(0,      peak - 5)
+            hi  = min(src_len, peak + 10)
+            # 新行作成 & append
+            win = torch.full((heads, 1, S), NEG, device=device)
+            win[:, :, lo:hi] = 0.0
+            if lo == hi:
+                win[:, :, peak:peak+1] = 0.0
+            memory_mask = win if memory_mask is None else torch.cat([memory_mask, win], dim=1)
 
-            # EOS チェック
-            ended |= (self.token_classifier(last).argmax(-1) == 1)
-            if ended.all():
-                break
+            # ── (e) 次トークン入力の生成 ─────────────────────────
+            emb = self.mel_proj(m_pred) + self.pitch_proj(p_pred.unsqueeze(-1))
+            emb = self.posenc(emb.unsqueeze(1), start=T).squeeze(1)
+            cur = torch.cat([cur, emb.unsqueeze(1)], dim=1)
 
-        mel_seq   = torch.cat(decoded_m, dim=1)  # (B, T, F)
-        pitch_seq = torch.cat(decoded_p, dim=1)  # (B, T)
+        # ── 最終シーケンス生成 ─────────────────────────────────
+        mel_seq   = torch.cat(outs_mel,   dim=1)  # (1, max_len, F)
+        pitch_seq = torch.cat(outs_pitch, dim=1)  # (1, max_len)
         return mel_seq, pitch_seq
-
-
-    '''
-    def greedy_decode(self, src_mel, src_pitch, max_len=200):
-        """
-        Greedy decode using log-mel spectrogram and pitch with causal mask and dynamic monotonic control.
-        Returns mel_seq: (B, T, F), pitch_seq: (B, T)
-        """
-        B, S, _ = src_mel.size()
-        device = src_mel.device
-
-        # --- Encode ---
-        x = self.mel_proj(src_mel) + self.pitch_proj(src_pitch.unsqueeze(-1))
-        x = self.posenc(x)
-        for layer in self.encoder_layers:
-            x2, _ = layer['self_attn'](x, x, x)
-            x = layer['ffn'](x + x2)
-            p = self.pitch_proj(src_pitch.unsqueeze(-1))
-            x2p, _ = layer['pitch_attn'](x, p, p)
-            x = layer['ffn'](x + x2p)
-        memory = x
-
-        # prepare monotonic mask placeholder
-        memory_mask = None
-
-        # --- Decode loop ---
-        current = self.bos_token.expand(B, 1, self.d_model)
-        decoded_m, decoded_p = [], []
-        ended = torch.zeros(B, dtype=torch.bool, device=device)
-
-        for t in range(max_len):
-            y = current
-            for layer in self.decoder_layers:
-                # 1) causal self-attention
-                T_y = y.size(1)
-                causal_mask = torch.triu(torch.full((T_y, T_y), float('-inf'), device=device), diagonal=1)
-                y2, _ = layer['self_attn'](y, y, y, attn_mask=causal_mask)
-                y = layer['ffn'](y + y2)
-
-                # 2) pitch cross-attention
-                p_stream = torch.cat([
-                    torch.zeros(B, 1, self.d_model, device=device),
-                    torch.cat(decoded_p, dim=1).unsqueeze(-1) if decoded_p else torch.zeros(B, 1, 1, device=device)
-                ], dim=1)
-                y2p, _ = layer['pitch_attn'](y, p_stream, p_stream)
-                y = layer['ffn'](y + y2p)
-
-                # 3) diagonal + dynamic monotonic cross-attention
-                diag_mask = compute_diagonal_mask(y.size(1), S, self.nu, device)
-                combined = diag_mask
-                if memory_mask is not None:
-                    combined = combined + memory_mask
-                bool_mask = (combined == float('-inf'))
-                y2m, attn_w = layer['cross_attn'](y, memory, memory, attn_mask=bool_mask, need_weights=True)
-                y = layer['ffn'](y + y2m)
-
-                # update dynamic mask based on last attention
-                last_attn = attn_w[:, -1, :].mean(dim=0)  # (S,)
-                pos = torch.argmax(last_attn).item()
-                start = max(pos - 5, 0)
-                end = min(pos + 10, S)
-                # build new mask for next step
-                m_mask = torch.full((y.size(1), S), float('-inf'), device=device)
-                m_mask[:, start:end] = 0.0
-                memory_mask = m_mask
-
-            # predict last frame
-            last = y[:, -1, :]
-            m_pred = self.out_mel(last)           # (B, F)
-            p_pred = self.out_pitch(last).squeeze(-1)  # (B,)
-            decoded_m.append(m_pred.unsqueeze(1))
-            decoded_p.append(p_pred.unsqueeze(1))
-
-            # prepare next input
-            fused = self.mel_proj(m_pred) + self.pitch_proj(p_pred.unsqueeze(-1))
-            fused = self.posenc(fused.unsqueeze(1), start=current.size(1)).squeeze(1)
-            current = torch.cat([current, fused.unsqueeze(1)], dim=1)
-
-            # check EOS
-            ended |= (self.token_classifier(last).argmax(-1) == 1)
-            if ended.all():
-                break
-
-        mel_seq = torch.cat(decoded_m, dim=1)
-        pitch_seq = torch.cat(decoded_p, dim=1)
-        return mel_seq, pitch_seq
-    '''
     
     def predict(self, src_mel, src_pitch, max_len=200):
         """

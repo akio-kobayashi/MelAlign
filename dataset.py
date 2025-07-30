@@ -63,7 +63,7 @@ class Mel2MelDataset(Dataset):
         self.std_mel = stats['mel_std']
         self.mean_f0 = stats['pitch_mean']
         self.std_f0  = stats['pitch_std']
-
+        #print(f'{self.mean_mel.shape} {self.std_mel.shape} {self.mean_f0} {self.std_f0}')
     def __len__(self) -> int:
         return len(self.df)
 
@@ -84,17 +84,17 @@ class Mel2MelDataset(Dataset):
         src_mel = self._check_mel(src['mel'])
         tgt = torch.load(row['target'], map_location=self.map_location)
         tgt_mel = self._check_mel(tgt['mel'])
-        
+
         src_mel   = (src_mel.float() - self.mean_mel) / (self.std_mel + 1.e-9)
         src_pitch = (src['log_f0'].float() - self.mean_f0) / (self.std_f0 + 1.e-9)
         tgt_mel   = (tgt_mel.float() - self.mean_mel) / (self.std_mel + 1.e-9)
         tgt_pitch = (tgt['log_f0'].float() - self.mean_f0) / (self.std_f0 + 1.e-9)
-
+        
         return src_mel, src_pitch, tgt_mel, tgt_pitch
 
-    def denormalize(self, mel, pitch):
-        return (mel * self.std_mel) + self.mean_mel, (pitch * self.std_f0) + self.mean_f0
-
+    def denormalize(self, mel):
+        return (mel * self.std_mel) + self.mean_mel
+    
 if __name__ == '__main__':
     from torch.utils.data import DataLoader
     ds = Mel2MelDataset('path/to/pairs.csv')

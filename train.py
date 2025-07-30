@@ -8,6 +8,9 @@ from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.tuner import Tuner
+from torch.utils.data import ConcatDataset
+from pytorch_lightning.callbacks import EarlyStopping
 
 # local modules for Mel-to-Mel alignment
 torch.set_float32_matmul_precision("high")
@@ -25,6 +28,9 @@ warnings.filterwarnings(
 )
 
 def train(cfg: dict):
+    # オプションのチェックポイントパス
+    ckpt_path = cfg.get("ckpt_path", None)
+    
     stats = torch.load(cfg["stats_tensor"], map_location="cpu", weights_only=True)
     # ─── dataset ───────────────────────────────────────────
     train_ds = Mel2MelDataset(
@@ -57,6 +63,7 @@ def train(cfg: dict):
     # ─── model ─────────────────────────────────────────────
     model = MelAlignTransformerSystem(
         lr=cfg.get("lr", 2e-4),
+        weight_decay = cfg.get("weight_decay", 0.5),
         input_dim_mel=cfg.get("input_dim_mel", 80),
         input_dim_pitch=cfg.get("input_dim_pitch", 1),
         d_model=cfg.get("d_model", 256),
@@ -66,30 +73,46 @@ def train(cfg: dict):
         dropout=cfg.get("dropout", 0.1),
         diag_w=cfg.get("diag_w", 1.0),
         ce_w=cfg.get("ce_w", 1.0),
-        #free_run_interval=cfg.get("free_run_interval", 100),
-        #free_run_weight=cfg.get("free_run_weight", 1.0),
-        #free_run_segment=cfg.get("free_run_segment", 200),
+        scheduler=cfg.get("scheduler"),
+        free_run_steps=cfg.get("free_run_steps", 10),
+        free_run_w=cfg.get("free_run_w", 0.1),
+        free_run_steps_schedule=cfg.get("free_run_steps_schedule"),
+        use_f0=cfg.get("use_f0", True)
     )
 
     # ─── callbacks / logger ─────────────────────────────────
     ckpt_cb = ModelCheckpoint(
         dirpath=cfg["ckpt_dir"],
-        filename="{epoch:02d}-{val_loss:.4f}",
-        monitor="val_loss",
+        filename="{epoch:02d}-{val_free_total:.4f}",
+        monitor="val_free_total",
         mode="min",
         save_top_k=3,
         save_last=True,
         every_n_epochs=1,
     )
-    '''
-    greedy_cb = GreedyEvalCallbackMel(
-        every_n_epochs=cfg.get("greedy_every_n_epochs", 5),
-        max_len=cfg.get("greedy_max_len", 1000),
-        num_batches=cfg.get("greedy_num_batches", 50),
-    )
-    '''
     lr_monitor = LearningRateMonitor(logging_interval="step")
-    tb_logger = TensorBoardLogger(save_dir=cfg["log_dir"], name="m2m_align")
+    early_stop = EarlyStopping(
+        monitor="val_loss",
+        patience=10,        # 改善が20エポック続かなければ停止
+        mode="min",
+        verbose=True
+    )    
+    from pathlib import Path
+
+    # ckpt_path があれば同じ version に追記する
+    if ckpt_path:
+        # 例: logs/m2m_align/version_0/checkpoints/last.ckpt
+        version = Path(ckpt_path).parents[1].name  # 'version_0'
+        tb_logger = TensorBoardLogger(
+            save_dir=cfg["log_dir"],
+            name="m2m_align",
+            version=version,
+        )
+    else:
+        tb_logger = TensorBoardLogger(
+            save_dir=cfg["log_dir"],
+            name="m2m_align",
+        )
 
     # ─── trainer ────────────────────────────────────────────
     trainer = pl.Trainer(
@@ -102,15 +125,20 @@ def train(cfg: dict):
         gradient_clip_algorithm="norm",
         default_root_dir=cfg["work_dir"],
         logger=tb_logger,
-        callbacks=[ckpt_cb, lr_monitor],
+        callbacks=[ckpt_cb, lr_monitor, early_stop],
         profiler="simple",
         check_val_every_n_epoch=1,
+        accumulate_grad_batches=cfg.get("accumulate_grad_batches", 4),
     )
 
+    
     # ─── fit ────────────────────────────────────────────────
-    trainer.fit(model, train_dl, valid_dl)
-
+    # ckpt_path を指定すると，そのチェックポイントから学習を再開する
+    trainer.fit(model, train_dl, valid_dl, ckpt_path=ckpt_path)
+    
 if __name__ == "__main__":
+    torch.autograd.set_detect_anomaly(True)
+    
     parser = argparse.ArgumentParser(
         description="Train Mel-to-Mel alignment model"
     )
@@ -118,9 +146,17 @@ if __name__ == "__main__":
         "--config", type=str, default="config.yaml",
         help="YAML config for mel2mel training"
     )
+    parser.add_argument(
+        "--ckpt_path", type=str, default=None,
+        help="(optional) Path to a pretrained .ckpt file to resume from"
+    )
+    
     args = parser.parse_args()
 
     with Path(args.config).open("r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
-
+        
+    # コマンドライン引数があれば優先して設定に登録
+    if args.ckpt_path is not None:
+        cfg["ckpt_path"] = args.ckpt_path
     train(cfg)
