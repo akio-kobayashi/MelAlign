@@ -33,15 +33,17 @@ def train(cfg: dict):
     
     stats = torch.load(cfg["stats_tensor"], map_location="cpu", weights_only=True)
     # ─── dataset ───────────────────────────────────────────
+    sort_by_len=cfg.get("sort_by_len", False)
     train_ds = Mel2MelDataset(
         cfg["train_csv"],
         stats, 
         map_location=cfg.get("map_location", "cpu"),
+        sort_by_len=sort_by_len,
     )
     train_dl = DataLoader(
         train_ds,
         batch_size=cfg.get("batch_size", 8),
-        shuffle=True,
+        shuffle=not sort_by_len,
         num_workers=cfg.get("num_workers", 4),
         collate_fn=collate_m2m,
         pin_memory=True,
@@ -63,7 +65,7 @@ def train(cfg: dict):
     # ─── model ─────────────────────────────────────────────
     model = MelAlignTransformerSystem(
         lr=cfg.get("lr", 2e-4),
-        weight_decay = cfg.get("weight_decay", 0.5),
+        weight_decay=cfg.get("weight_decay", 0.5),
         input_dim_mel=cfg.get("input_dim_mel", 80),
         input_dim_pitch=cfg.get("input_dim_pitch", 1),
         d_model=cfg.get("d_model", 256),
@@ -73,18 +75,17 @@ def train(cfg: dict):
         dropout=cfg.get("dropout", 0.1),
         diag_w=cfg.get("diag_w", 1.0),
         ce_w=cfg.get("ce_w", 1.0),
-        scheduler=cfg.get("scheduler"),
-        free_run_steps=cfg.get("free_run_steps", 10),
-        free_run_w=cfg.get("free_run_w", 0.1),
-        free_run_steps_schedule=cfg.get("free_run_steps_schedule"),
-        use_f0=cfg.get("use_f0", True)
-    )
+        ga_w=cfg.get("ga_w", 2.0),
+        use_f0=cfg.get("use_f0", True),
+        mono_w=cfg.get("mono_w", 0.1),
+        nu=cfg.get("nu", 0.3)
+    )    
 
     # ─── callbacks / logger ─────────────────────────────────
     ckpt_cb = ModelCheckpoint(
         dirpath=cfg["ckpt_dir"],
-        filename="{epoch:02d}-{val_free_total:.4f}",
-        monitor="val_free_total",
+        filename="{epoch:02d}-{val_loss:.4f}",
+        monitor="val_loss",    
         mode="min",
         save_top_k=3,
         save_last=True,
@@ -93,8 +94,9 @@ def train(cfg: dict):
     lr_monitor = LearningRateMonitor(logging_interval="step")
     early_stop = EarlyStopping(
         monitor="val_loss",
-        patience=10,        # 改善が20エポック続かなければ停止
         mode="min",
+        patience=30,         # 改善が20エポック続かなければ停止
+        min_delta=1e-4,      # 0.001以上の改善で更新とみなす
         verbose=True
     )    
     from pathlib import Path

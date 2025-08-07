@@ -33,7 +33,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 #from model import TransformerAlignerMel
 from model2 import MelPitchAligner
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 class MelAlignTransformerSystem(pl.LightningModule):
     def __init__(self,
@@ -48,15 +48,39 @@ class MelAlignTransformerSystem(pl.LightningModule):
                  dropout: float = 0.1,
                  diag_w: float = 1.0,
                  ce_w: float = 1.0,
-                 scheduler: dict = None,
-                 free_run_steps: int = 10,
+                 ga_w: float=2.0,
+                 free_run_steps: int = 1,
                  free_run_w: float = 0.1,
-                 free_run_steps_schedule: List[Dict[str,int]] = None,
-                 use_f0: bool = True):
-        
+                 free_run_steps_schedule: Optional[dict] = None,
+                 use_f0: bool = True,
+                 # ----- adaptive curriculum hyper-params -----
+                 w_min: float = 0.05,
+                 w_max: float = 1.0,
+                 inc_factor: float = 1.15,
+                 dec_factor: float = 0.85,
+                 patience: int = 3,
+                 delta: float = 0.03,
+                 mono_w: float = 0.1,
+                 nu: float = 0.3):                 
+       
         super().__init__()
-        self.free_run_steps_schedule = free_run_steps_schedule or []       
+        # 初期値として free_run_steps, free_run_w を設定し、manual schedule のみ使用
         self.save_hyperparameters()
+        self.free_run_steps_schedule = free_run_steps_schedule or []
+
+        # ──────────────────────────────────────────────
+        # (1) Target-SNR curriculum  *******************
+        #    * list of tuples (epoch_threshold, SNR_dB)
+        #    * SNR = None  →  ノイズを入れない
+        # ──────────────────────────────────────────────
+        self.snr_schedule: List[Tuple[int, Optional[float]]] = [
+            (0,  None),       # Stabilize      (clean)
+            (10, 20.0),       # Light noise    (20 dB)
+            (20, 10.0),       # Mid noise      (10 dB)
+            (30,  5.0),       # Heavy noise    ( 5 dB)
+        ]
+        self._current_snr_db: Optional[float] = None
+
         self.model = MelPitchAligner(
             input_dim_mel   = self.hparams.input_dim_mel,
             input_dim_pitch = self.hparams.input_dim_pitch,
@@ -65,103 +89,133 @@ class MelAlignTransformerSystem(pl.LightningModule):
             num_layers      = self.hparams.num_layers,
             dim_feedforward = self.hparams.dim_ff,
             dropout         = self.hparams.dropout,
-            nu              = 0.3,
+            nu              = self.hparams.nu,
             diag_w          = self.hparams.diag_w,
             ce_w            = self.hparams.ce_w,
-            free_run_steps  = self.hparams.free_run_steps,
-            free_run_w      = self.hparams.free_run_w,
+            ga_w            = self.hparams.ga_w,
             use_f0          = self.hparams.use_f0,
+            mono_w          = self.hparams.mono_w
         )
 
-    def forward(self,
-                src_mel, src_pitch, src_lengths,
-                tgt_mel, tgt_pitch, tgt_lengths):
-        # src_lengths, tgt_lengths を内部で attention mask／loss mask に利用
-        return self.model(src_mel, src_pitch, src_lengths,
-                          tgt_mel, tgt_pitch, tgt_lengths)
+        # ----- state for adaptive curriculum -----
+        self.best_free_mel: Optional[float] = None
+        self.no_improve_epochs: int = 0        
+        # --- internal flag : True の epoch は adaptive w 更新をスキップ ---
+        self._manual_w_this_epoch: bool = False
+
+    def forward(
+        self,
+        src_mel:   torch.Tensor,
+        tgt_mel:   torch.Tensor,
+        src_pitch: torch.Tensor,
+        tgt_pitch: torch.Tensor,
+        src_lengths: torch.Tensor,
+        tgt_lengths: torch.Tensor,
+        epoch: int,
+        batch_idx: int,
+        save_dir: str = None,
+        nu: float     = None,
+        weight: float = None,
+        save_maps: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        LightningModule → MelPitchAligner への薄いラッパー。
+        * weight 以降は **必ずキーワード渡し** にすること!
+        """
+        return self.model.forward(
+            src_mel, tgt_mel, src_pitch, tgt_pitch,
+            src_lengths, tgt_lengths,
+            nu=nu,
+            weight=weight,
+            epoch=epoch,
+            batch_idx=batch_idx,
+            save_dir=save_dir,
+            keep_maps=save_maps,   # ← MelPitchAligner 側の引数名に合わせる
+        )        
 
     def training_step(self, batch, batch_idx):
         src_m, src_p, tgt_m, tgt_p, src_len, tgt_len = batch
-        loss_tf, metrics = self(src_m, src_p, src_len, tgt_m, tgt_p, tgt_len)
-        # サブ・ロスをステップごとにログ
-        self.log_dict(metrics, on_step=True, on_epoch=True, prog_bar=False)
-        # 全体のトータル・ロスをエポックごとにプログレスバー表示
-        self.log('train_loss', loss_tf, on_step=False, on_epoch=True, prog_bar=True)
-        # メル損失(mel_l1)をエポックごとにプログレスバー表示
-        self.log('train_mel_l1', metrics['mel_l1'], on_step=False, on_epoch=True, prog_bar=True)
-        
+
+        # ──────────────────────────────────────────────
+        # (2) Dynamic Mix-Sampling λ  ******************
+        #     * Uniform(0.0, 0.5)  を各ステップで再サンプル
+        # ──────────────────────────────────────────────
+        self.model.mix_lam = torch.rand(1, device=self.device).item() * 0.5
+
+        # ──────────────────────────────────────────────
+        # (1) Spectral-noise injection  ****************
+        # ──────────────────────────────────────────────
+        if self._current_snr_db is not None:
+            # パワー計算（mean of power over (B,T,D)）
+            power = (tgt_m ** 2).mean(dim=(1, 2), keepdim=True)  # (B,1,1)
+            noise_power = power / (10.0 ** (self._current_snr_db / 10.0))
+
+            # 1/f ノイズ近似: 周波数次元に重み 1/(f+1)
+            D = tgt_m.size(-1)
+            freqs = torch.arange(D, device=self.device).float() + 1.0
+            pink_weight = 1.0 / freqs.unsqueeze(0).unsqueeze(0)  # (1,1,D)
+
+            gauss = torch.randn_like(tgt_m)
+            gauss = gauss * pink_weight                          # Pink-ish
+            gauss = gauss / gauss.std(dim=(1, 2), keepdim=True) # σ=1 に正規化
+
+            noise = torch.sqrt(noise_power) * gauss
+            tgt_m = tgt_m + noise
+
+        # teacher-forcing only
+        pred, loss_tf, mel_loss, diag_loss, ga_loss = self(
+            src_m, tgt_m, src_p, tgt_p, src_len, tgt_len,
+            self.current_epoch, batch_idx, "./attn_maps/",
+            self.hparams.nu, self.hparams.ce_w, save_maps=True
+            
+        )
+        # ログ出力
+        self.log('train_loss', loss_tf,    on_step=False, on_epoch=True, prog_bar=True)
+        self.log('train_mel_l1', mel_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('train_diag', diag_loss,  on_step=False, on_epoch=True, prog_bar=False)
+        self.log('train_ga', ga_loss,  on_step=False, on_epoch=True, prog_bar=False)
         return loss_tf
     
     def validation_step(self, batch, batch_idx):
         src_m, src_p, tgt_m, tgt_p, src_len, tgt_len = batch
-        # —— teacher-forced の損失とサブメトリクス
-        loss_tf, metrics = self(src_m, src_p, src_len, tgt_m, tgt_p, tgt_len)
+        # teacher-forcing only
+        pred, loss_tf, mel_loss, diag_loss, ga_loss = self(
+            src_m, tgt_m, src_p, tgt_p, src_len, tgt_len,
+            epoch        = self.current_epoch,   # ★必須
+            batch_idx    = batch_idx,            # ★必須
+            save_dir     = None,
+            nu           = self.hparams.nu,
+            weight       = self.hparams.ce_w,
+            save_maps    = False
+         )        
         val_loss = loss_tf
-        self.log('val_mel_l1', metrics['mel_l1'], on_step=False, on_epoch=True, prog_bar=True)
+        self.log('val_mel_l1', mel_loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log('val_loss', val_loss, on_step=False, on_epoch=True, prog_bar=True)
-        # —— free_run 損失をバッチ全体で計算してログ
-        if self.hparams.free_run_w > 0.0:
-            # バッチ中の最小ターゲット長を取得
-            min_len = tgt_len.min().item()
-            # L は free_run_steps と min_len の小さいほう
-            L = min(self.hparams.free_run_steps, min_len)
-            if L > 0:
-                # 安全な開始位置 p をランダム選択
-                p = torch.randint(0, min_len - L + 1, (1,)).item()
-                # エンコード済みメモリをバッチ全体で detach
-                memory_detach = self.model.encode(src_m, src_p)
-                # 部分系列で自己回帰デコード
-                mel_free, f0_free = self.model.decode_free_run(memory_detach, p, L)
-                # 教師信号を対応箇所から切り出し
-                mel_gt     = tgt_m[:, p:p+L]
-                loss_free_m = F.l1_loss(mel_free, mel_gt)
-                self.log('val_free_mel', loss_free_m, on_step=False, on_epoch=True, prog_bar=True)
-                # f0 損失も同様にバッチ全体で
-                if self.hparams.use_f0:
-                    f0_gt       = tgt_p[:, p:p+L]
-                    loss_free_f = F.l1_loss(f0_free, f0_gt)
-                    self.log('val_free_f0', loss_free_f, on_step=False, on_epoch=True, prog_bar=True)
-                    val_free_total = loss_free_m + loss_free_f
-                else:
-                    val_free_total = loss_free_m
-                self.log('val_free_total', val_free_total, on_step=False, on_epoch=True, prog_bar=True)        
-        '''
-        # —— free_run 損失は別指標としてログ（モデル選択に使う場合は monitor="val_free_mel" 等に）
-        if self.hparams.free_run_w > 0.0:
-            idx = torch.randint(0, src_m.size(0), (1,)).item()
-            memory = self.model.encode(src_m[idx:idx+1], src_p[idx:idx+1])
-            L = min(self.hparams.free_run_steps, tgt_m.size(1))
-            p = torch.randint(0, tgt_m.size(1) - L + 1, (1,)).item()
-            mel_free, f0_free = self.model.decode_free_run(memory, p, L)
-            mel_gt = tgt_m[idx:idx+1, p:p+L]
-            loss_free_m = F.l1_loss(mel_free, mel_gt)
-            self.log('val_free_mel', loss_free_m, on_step=False, on_epoch=True, prog_bar=True)
-            val_free_total = loss_free_m
-            if self.hparams.use_f0:
-                f0_gt  = tgt_p[idx:idx+1, p:p+L]
-                loss_free_f = F.l1_loss(f0_free, f0_gt)
-                # モニタリング用
-                self.log('val_free_f0',  loss_free_f, on_step=False, on_epoch=True, prog_bar=True)
-
-                val_free_total += loss_free_f
-            self.log('val_free_total', val_free_total, on_epoch=True, prog_bar=True)
-        ''' 
-        return loss_tf        
+        return loss_tf
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr)
-
-        def lr_lambda(step):
-            warmup_steps = 4000
-            return min(step / warmup_steps, 1.0)
-    
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        # Adam optimizer with weight decay
+        optimizer = torch.optim.Adam(
+            self.parameters(),
+            lr=self.hparams.lr,
+            weight_decay=self.hparams.weight_decay
+        )
+        # Reduce LR on plateau of val_loss
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=0.5,
+            patience=5,
+            threshold=1e-4,
+            verbose=True
+        )
         return {
             'optimizer': optimizer,
             'lr_scheduler': {
                 'scheduler': scheduler,
-                'interval': 'step',
-                'frequency': 1
+                'monitor': 'val_loss',
+                'interval': 'epoch',
+                'frequency': 1,
             }
         }    
     
@@ -169,9 +223,4 @@ class MelAlignTransformerSystem(pl.LightningModule):
         pass
 
     def on_train_epoch_start(self):
-        # 現在のエポック数に応じて free_run_steps を更新
-        for item in self.free_run_steps_schedule:
-            if self.current_epoch >= item["epoch"]:
-                self.model.free_run_steps = item["steps"]
-        # いくつかログに出しておくと安心
-        self.log("free_run_steps", self.model.free_run_steps, prog_bar=True)
+        pass

@@ -68,15 +68,24 @@ def main():
         # move to device
         src_m = src_m.to(device)
         src_p = src_p.to(device)
-        src_len = src_len.to(device)
+        # greedy_decode には Python の int を渡す
+        src_len = src_len.to(device)[0].item()
+       
         with torch.no_grad():
-            mel_pred, pitch_pred = model.model.greedy_decode(src_m, src_p, src_len, max_len=args.max_len)
-        # squeeze batch dim
-        mel_pred = ds.denormalize(mel_pred.cpu())
+            # greedy_decode は mel_pred のみ返す
+            mel_pred = model.model.greedy_decode(
+                src_m,           # (1, T_src, D)
+                src_p,           # (1, T_src)
+                src_len,         # int
+                max_len=args.max_len
+            )
+        # バッチ次元を落としてから denormalize
         mel_pred = mel_pred.squeeze(0).cpu()   # (T, F)
+        mel_pred = ds.denormalize(mel_pred)
+            
         print(torch.mean(mel_pred), torch.max(mel_pred), torch.min(mel_pred))
-        mel_src = ds.denormalize(src_m.cpu())
-        print(torch.mean(mel_src), torch.max(mel_src), torch.min(mel_src))
+        mel_src = ds.denormalize(src_m.squeeze(0).cpu())
+        print(torch.mean(mel_src), torch.max(mel_src), torch.min(mel_src))        
         
         # save
         # enumerate で得られた idx を使って DataFrame の該当行を取得

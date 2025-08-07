@@ -1,58 +1,42 @@
-# ======================= m2m_config.yaml =======================
-# Configuration for Mel-to-Mel alignment training
+# --- データセット関連 ---
+train_csv: "csv/F002_train_exB.csv"         # 訓練用 CSV ファイル
+valid_csv: "csv/F002_valid_exB.csv"         # 検証用 CSV ファイル
+stats_tensor: "./stats.pt"       # 正規化の平均・分散などが保存されたTensor
+sort_by_len: true
+# --- データローダー設定 ---
+batch_size: 8
+num_workers: 4
+map_location: "cpu"                    # または "cuda"（stats, .ptロード時）
 
-# ────────────────────────────────
-#  Dataset
-# ────────────────────────────────
-train_csv:    align/train.csv     # CSV with 'source','target' columns pointing to .pt files with 'mel' & 'log_f0'
-valid_csv:    align/valid.csv
-map_location: cpu                 # torch.load map_location
+# --- モデル構成 ---
+input_dim_mel: 80
+input_dim_pitch: 1
+d_model: 512
+nhead: 8
+num_layers: 8
+dim_ff: 1024
+dropout: 0.2
+use_f0: false                           # false で F0 系の層を無効化
+nu: 0.3
 
-# ────────────────────────────────
-#  DataLoader
-# ────────────────────────────────
-batch_size:   4
-num_workers:  4
+# --- 損失関係 ---
+diag_w: 10.0                            # attention対角制約の重み
+ga_w: 10.0
+ce_w: 1.0                              # token分類があればその重み
 
-# ────────────────────────────────
-#  Model / Transformer Hyperparameters
-# ────────────────────────────────
-input_dim_mel:    80            # Log-mel spectrogram size (n_mels)
-input_dim_pitch:  1             # Pitch feature size
-d_model:          256           # Transformer hidden dimension
-nhead:            4             # Number of attention heads
-num_layers:       3             # Number of encoder/decoder layers
-dim_ff:           512           # Feed-forward hidden dimension
-dropout:          0.1           # Dropout rate
+# --- 学習設定 ---
+lr: 2.0e-4
+weight_decay: 0.5
 
-# ────────────────────────────────
-#  Loss weights
-# ────────────────────────────────
-diag_w:            1.0         # Diagonal attention regularization weight
-ce_w:              1.0         # EOS classification weight
+# --- Trainer 設定 ---
+max_epochs: 200
+gpus: 1                                # GPU数（CPUの場合は0）
+precision: "16-mixed"
+gradient_clip_val: 5.0
+accumulate_grad_batches: 4
 
-# ────────────────────────────────
-#  Free-run settings
-# ────────────────────────────────
-free_run_interval: 100          # Add free-run loss every N batches
-free_run_weight:   1.0          # Weight for free-run L1 loss
-free_run_segment:  200          # Segment length for free-run decoding
+# --- 出力先 ---
+work_dir: "/media/akio/hdd1/mel/models/free2"                    # Lightningの出力ルート
+log_dir: "/media/akio/hdd1/mel/models/free2"                        # TensorBoard ログ保存先
+ckpt_dir: "/media/akio/hdd1/mel/models/free2"                # チェックポイント保存先
 
-# ────────────────────────────────
-#  Optimizer / Training
-# ────────────────────────────────
-lr:                0.0002      # AdamW learning rate
-max_epochs:        100         # Total epochs
-gpus:              1           # Number of GPUs (or 0 for CPU)
-precision:         16-mixed    # Use mixed-precision training
-gradient_clip_val: 1.0         # Gradient clipping value
-
-# ────────────────────────────────
-#  Logging & Checkpoints
-# ────────────────────────────────
-work_dir:          /media/akio/hdd1/rvc/models/align/m2m      # Lightning default_root_dir
-log_dir:           /media/akio/hdd1/rvc/models/align/m2m/tb   # TensorBoard logs
-ckpt_dir:          /media/akio/hdd1/rvc/models/align/m2m/ckpt # ModelCheckpoint directory
-save_top_k:        3                                  # Keep top-3 checkpoints
-check_val_every_n_epoch: 1                              # How often to run validation
-# ===============================================================

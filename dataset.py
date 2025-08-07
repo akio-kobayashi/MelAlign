@@ -48,17 +48,25 @@ class Mel2MelDataset(Dataset):
       - 'log_f0': Tensor of shape (T,)
     Returns tuples (src_mel, src_pitch, tgt_mel, tgt_pitch).
     """
-    def __init__(self, csv_path: str or Path, stats: dict, map_location: str = 'cpu') -> None:
+    def __init__(self, csv_path: str or Path, stats: dict, map_location: str = 'cpu', sort_by_len: bool = False) -> None:
         self.map_location = map_location
         #self.rows: List[dict] = []
         csv_path = Path(csv_path)
         self.df = pd.read_csv(csv_path)
-        #with csv_path.open(newline='', encoding='utf-8') as f:
-        #    reader = csv.DictReader(f)
-        #    for row in reader:
-        #        if 'source' not in row or 'target' not in row:
-        #            raise ValueError("CSV must contain 'source' and 'target' columns")
-        #        self.rows.append(row)
+        
+        # 各サンプルのメル長を取得し、短い順に並べ替え
+        if sort_by_len:
+            print(f'use sorted-by-length dataset')
+            lengths = []
+            for idx, row in self.df.iterrows():
+                # ファイル読み込み mel のフレーム長を取得
+                data = torch.load(row['source'], map_location=self.map_location)
+                mel  = self._check_mel(data['mel'])
+                lengths.append(mel.size(0))
+            # ソート用インデックスを計算し df を再構築
+            sorted_idx = sorted(range(len(lengths)), key=lambda i: lengths[i])
+            self.df = self.df.iloc[sorted_idx].reset_index(drop=True)
+
         self.mean_mel = stats['mel_mean']
         self.std_mel = stats['mel_std']
         self.mean_f0 = stats['pitch_mean']
